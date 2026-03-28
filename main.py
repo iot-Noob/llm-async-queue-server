@@ -1,6 +1,4 @@
-from langchain_community.chat_models import ChatLlamaCpp
-from langchain_core.output_parsers import PydanticOutputParser,StrOutputParser,JsonOutputParser,SimpleJsonOutputParser
-from langchain_core.prompts import ChatPromptTemplate,PromptTemplate
+import llama_cpp
 from pydantic import BaseModel, Field,field_validator,ConfigDict
 from pydantic_settings import BaseSettings
 import gc
@@ -39,7 +37,7 @@ class AsyncLLM:
     def __init__(self):
        
         self.futures:Dict[str,asyncio.Future]={}    
-        self.current_model:Dict[str,ChatLlamaCpp]={}
+        self.current_model:Dict[str,llama_cpp.Llama]={}
         self.setting=Settings()
         self.path=self.setting.MODEL_PATH
         self.loop=uvloop.new_event_loop()
@@ -158,7 +156,7 @@ class AsyncLLM:
             
             # Load model in thread to avoid blocking
             llm = await asyncio.to_thread(
-                ChatLlamaCpp,
+                llama_cpp.Llama,
                 model_path=fmp,
                 temperature=temperature,
                 top_p=top_p,
