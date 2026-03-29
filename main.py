@@ -8,30 +8,55 @@ from langchain.embeddings import Embeddings
 from langchain_community.retrievers import WikipediaRetriever
 from uuid import uuid4
 import asyncio
-from typing import Dict,List,Union,Any
+from typing import Dict,List,Union,Any,Tuple
 import uvloop
 from queue import Queue
 import psutil
- 
-class StrOutputParser:
-    """Output parser with pipe operator"""
+import json
+
+class Runnable:
+    """Wrapper that makes any callable chainable with |"""
+    def __init__(self, func):
+        self.func = func
     
-    def parse(self, response: Union[Dict, str]) -> str:
+    async def __call__(self, *args, **kwargs):
+        result = self.func(*args, **kwargs)
+        if asyncio.iscoroutine(result):
+            return await result
+        return result
+    
+    def __or__(self, other):
+        # Return a new Runnable that calls self then other
+        async def chained(value):
+            result = await self(value)
+            return await other(result) if asyncio.iscoroutinefunction(other) else other(result)
+        return Runnable(chained)
+
+class StrOutputParser:
+    def parse(self, response):
+        if isinstance(response, str):
+            try:                
+                response = json.loads(response)
+            except json.JSONDecodeError:
+                return response.strip()
+        
         if isinstance(response, dict):
-            return response["choices"][0]["text"].strip()
+            if "choices" in response and len(response["choices"]) > 0:
+                return response["choices"][0].get("text", "").strip()
+            if "text" in response:
+                return response["text"].strip()
+        
         return str(response).strip()
     
-    def __call__(self, response: Union[Dict, str]) -> str:
+    def __call__(self, response):
         return self.parse(response)
     
     def __or__(self, other):
-        if callable(other):
-            def chained(value):
-                parsed = self(value)
-                return other(parsed)
-            return chained
-        return self
-        
+        def chained(value):
+            parsed = self(value)
+            return other(parsed) if callable(other) else parsed
+        return Runnable(chained)
+    
     def __ror__(self, other):
         return self.__or__(other)
     
@@ -52,20 +77,56 @@ class Settings(BaseSettings):
             raise ValueError(f"Error path not found {v}")
         return v
 
-class StrOutputParser:
-    """Simple output parser that extracts text from llama-cpp response"""
-    
-    def parse(self, response):
-        """Parse llama-cpp response dict to string"""
-        if isinstance(response, dict):
-            return response["choices"][0]["text"].strip()
-        return str(response)
-    
-    def __call__(self, response):
-        """Make it callable"""
-        return self.parse(response)
+ 
 
 
+class ChatPromptTemplate:
+
+    def __init__(self, messages: List[Tuple[str, str]]):
+        """Store the messages for later formatting"""
+        self.messages = messages
+
+    def format_prompt(self, **kwargs):
+        """Replace placeholders and return prompt string"""
+        result = ""
+        
+        for role, template in self.messages:
+            # Replace placeholders like {name} with values
+            content = template.format(**kwargs)
+            
+            # Convert role to format LLM understands
+            if role == "system":
+                result += f"[SYSTEM] {content}\n"
+            elif role == "human":
+                result += f"[USER] {content}\n"
+            elif role == "assistant":
+                result += f"[ASSISTANT] {content}\n"
+        
+        # Add final marker for LLM to start generating
+        result += "[ASSISTANT] "
+        return result
+    def __call__(self, **kwargs):
+        """Allow: template(topic="Python")"""
+        return self.format_prompt(**kwargs)
+        
+    def __or__(self, other):
+        async def chained(input_data):
+            if isinstance(input_data, dict):
+                prompt = self.format_prompt(**input_data)
+            else:
+                prompt = self.format_prompt(input=input_data)
+            return await other(prompt)   # <-- always await
+        return Runnable(chained)
+    
+    @classmethod
+    def from_messages(cls, messages:List[Tuple[str,str]]):
+        """Create template from message list"""
+        return cls(messages)
+
+    @classmethod
+    def from_template(cls, template: str):
+        """Create simple template from one string"""
+        return cls([("human", template)])
 class AsyncLLM:
  
     def __init__(self):
@@ -403,8 +464,8 @@ class AsyncLLM:
                 pr=parser(response=response)
 
                 result = response.content if hasattr(response, 'content') else str(response)
-
-                future.set_result(pr)
+                 
+                future.set_result(response)
                 self.queue.task_done() 
                 print(f"✅ Completed: {task_id}")
               
@@ -499,13 +560,10 @@ class AsyncLLM:
         return asyncio.run(self.ainvoke(input))
     
     def __or__(self, other):
-        """llm | parser"""
-        if callable(other):
-            async def chained(value):
-                response = await self.ainvoke(value)
-                return other(response)
-            return chained
-        return self
+        async def chained(value):
+            response = await self(value)   # calls __call__
+            return await other(response) if asyncio.iscoroutinefunction(other) else other(response)
+        return Runnable(chained)
     
     def __ror__(self, other):
         """prompt | llm"""
@@ -528,7 +586,12 @@ async def main():
     # 1. Create service
     llm = AsyncLLM()
     parser = StrOutputParser()
-    
+    cpt=ChatPromptTemplate.from_messages(
+     [
+    ("system","you are a helpful assistant hel me in any possible way"),
+        ("human","{input}")
+     ]
+    )
     # 2. Load model (MUST AWAIT!)
     await llm._load_model(model_name="glm-4-9b-chat-IQ4_XS.gguf")
     
@@ -536,30 +599,30 @@ async def main():
     await llm.start()
     
     # 4. Create chain (function that calls llm then parser)
-    chain = llm | parser
-    
+    chain = cpt | llm  |parser
     # 5. Chat with the LLM
     print("\n" + "="*60)
     print("CHATTING...")
     print("="*60)
     
-    response = await llm("What is Python?")
-    print(f"Response: {response[:200]}...")
+    response = await chain({"input":"What is Python?"})
+     
+    print(response)
     
-    # 6. Multiple users
-    print("\n" + "="*60)
-    print("3 USERS CONCURRENTLY")
-    print("="*60)
+    # # 6. Multiple users
+    # print("\n" + "="*60)
+    # print("3 USERS CONCURRENTLY")
+    # print("="*60)
     
-    results = await asyncio.gather(
-        llm("Tell me a joke"),
-        llm("Explain async programming"),
-        llm("Write a short essay on Pakistani village life"),
-        llm("What is machine learning?")
-    )
+    # results = await asyncio.gather(
+    #     chain({"input":"Tell me a joke"}),
+    #     chain({"input":"Explain async programming"}),
+    #     chain({"input":"Write a short essay on Pakistani village life"}),
+    #     chain({"input":"What is machine learning?"})
+    # )
     
-    for i, r in enumerate(results):
-        print(f"\nUser {i+1}: {r[:100]}...")
+    # for i, r in enumerate(results):
+    #     print(f"\nUser {i+1}: {r[:100]}...")
     
     # 7. Stop service
     await llm.stop()
