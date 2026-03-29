@@ -8,11 +8,33 @@ from langchain.embeddings import Embeddings
 from langchain_community.retrievers import WikipediaRetriever
 from uuid import uuid4
 import asyncio
-from typing import Dict,List
+from typing import Dict,List,Union,Any
 import uvloop
 from queue import Queue
 import psutil
  
+class StrOutputParser:
+    """Output parser with pipe operator"""
+    
+    def parse(self, response: Union[Dict, str]) -> str:
+        if isinstance(response, dict):
+            return response["choices"][0]["text"].strip()
+        return str(response).strip()
+    
+    def __call__(self, response: Union[Dict, str]) -> str:
+        return self.parse(response)
+    
+    def __or__(self, other):
+        if callable(other):
+            def chained(value):
+                parsed = self(value)
+                return other(parsed)
+            return chained
+        return self
+        
+    def __ror__(self, other):
+        return self.__or__(other)
+    
 
 class Settings(BaseSettings):
     model_config = ConfigDict(
@@ -30,7 +52,19 @@ class Settings(BaseSettings):
             raise ValueError(f"Error path not found {v}")
         return v
 
- 
+class StrOutputParser:
+    """Simple output parser that extracts text from llama-cpp response"""
+    
+    def parse(self, response):
+        """Parse llama-cpp response dict to string"""
+        if isinstance(response, dict):
+            return response["choices"][0]["text"].strip()
+        return str(response)
+    
+    def __call__(self, response):
+        """Make it callable"""
+        return self.parse(response)
+
 
 class AsyncLLM:
  
@@ -153,7 +187,7 @@ class AsyncLLM:
             print(f"   Temperature: {temperature}")
             print(f"   Max tokens: {max_tokens}")
             print(f"   GPU layers: {n_gpu_layers}")
-            
+       
             # Load model in thread to avoid blocking
             llm = await asyncio.to_thread(
                 llama_cpp.Llama,
@@ -350,7 +384,7 @@ class AsyncLLM:
         
         while self._running: 
             try:
-       
+                parser=StrOutputParser()
                 task = await asyncio.wait_for(self.queue.get(), timeout=60.0)
                 
                 task_id = task["task_id"]
@@ -365,14 +399,15 @@ class AsyncLLM:
                     continue
          
                 model = list(self.current_model.values())[0]
-                response = await asyncio.to_thread(model.invoke, prompt)
+                response = await asyncio.to_thread(model, prompt)
+                pr=parser(response=response)
 
                 result = response.content if hasattr(response, 'content') else str(response)
 
-                future.set_result(result)
+                future.set_result(pr)
                 self.queue.task_done() 
                 print(f"✅ Completed: {task_id}")
-                self.queue.task_done() 
+              
             except asyncio.TimeoutError:
                 print(f"Timeout on task {task_id}")
                 continue
@@ -449,7 +484,41 @@ class AsyncLLM:
         except Exception as e:
             print(f"❌ Error in chat: {e}")
             raise
-
+        
+    async def ainvoke(self, input: Union[str, Dict]) -> str:
+        """Async invoke for chaining"""
+        if isinstance(input, dict):
+            prompt = input.get("input", str(input))
+        else:
+            prompt = str(input)
+        return await self.chat_llm(prompt)
+    
+    def invoke(self, input: Union[str, Dict]) -> str:
+        """Sync invoke"""
+     
+        return asyncio.run(self.ainvoke(input))
+    
+    def __or__(self, other):
+        """llm | parser"""
+        if callable(other):
+            async def chained(value):
+                response = await self.ainvoke(value)
+                return other(response)
+            return chained
+        return self
+    
+    def __ror__(self, other):
+        """prompt | llm"""
+        if callable(other):
+            async def chained(value):
+                processed = other(value)
+                return await self.ainvoke(processed)
+            return chained
+        return self
+    async def __call__(self, input: Union[str, Dict]) -> str:
+        """Make the instance callable directly"""
+        return await self.ainvoke(input)
+    
 # ========== CORRECT USAGE ==========
 async def main():
     print("="*60)
@@ -458,6 +527,7 @@ async def main():
     
     # 1. Create service
     llm = AsyncLLM()
+    parser = StrOutputParser()
     
     # 2. Load model (MUST AWAIT!)
     await llm._load_model(model_name="glm-4-9b-chat-IQ4_XS.gguf")
@@ -465,33 +535,36 @@ async def main():
     # 3. Start the worker
     await llm.start()
     
-    # 4. Chat with the LLM
+    # 4. Create chain (function that calls llm then parser)
+    chain = llm | parser
+    
+    # 5. Chat with the LLM
     print("\n" + "="*60)
     print("CHATTING...")
     print("="*60)
     
-    response = await llm.chat_llm("What is Python?")
+    response = await llm("What is Python?")
     print(f"Response: {response[:200]}...")
     
-    # 5. Multiple users
+    # 6. Multiple users
     print("\n" + "="*60)
     print("3 USERS CONCURRENTLY")
     print("="*60)
     
     results = await asyncio.gather(
-        llm.chat_llm("Tell me a joke"),
-        llm.chat_llm("Explain async programming"),
-        llm.chat_llm("Write 500 lin eessay on pakistani village life"),
-        llm.chat_llm("What is machine learning?")
+        llm("Tell me a joke"),
+        llm("Explain async programming"),
+        llm("Write a short essay on Pakistani village life"),
+        llm("What is machine learning?")
     )
     
     for i, r in enumerate(results):
         print(f"\nUser {i+1}: {r[:100]}...")
     
-    # 6. Stop service
+    # 7. Stop service
     await llm.stop()
     
-    # 7. Unload model
+    # 8. Unload model
     llm.unload_model("glm-4-9b-chat-IQ4_XS.gguf")
     
     print("\n✅ All done!")
