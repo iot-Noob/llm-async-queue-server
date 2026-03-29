@@ -1,5 +1,5 @@
 import llama_cpp
-from pydantic import BaseModel, Field,field_validator,ConfigDict
+from pydantic import BaseModel, Field,field_validator,ConfigDict,ValidationError
 from pydantic_settings import BaseSettings
 import gc
 import ctypes
@@ -8,7 +8,7 @@ from langchain.embeddings import Embeddings
 from langchain_community.retrievers import WikipediaRetriever
 from uuid import uuid4
 import asyncio
-from typing import Dict,List,Union,Any,Tuple
+from typing import Dict,List,Union,Any,Tuple,Type,TypeVar
 import uvloop
 from queue import Queue
 import psutil
@@ -27,10 +27,24 @@ class Runnable:
     
     def __or__(self, other):
         # Return a new Runnable that calls self then other
+        ### What it does is get reslut form current function user pass then other instance function or anything pass taht vale to next chain
         async def chained(value):
             result = await self(value)
             return await other(result) if asyncio.iscoroutinefunction(other) else other(result)
         return Runnable(chained)
+
+
+
+class JsonOutputParser:
+    
+    def __init__(self):
+        pass
+
+    def __call__(self, *args, **kwds):
+        pass
+
+    def __or__(self, value):
+        pass
 
 class StrOutputParser:
     def parse(self, response):
@@ -76,14 +90,10 @@ class Settings(BaseSettings):
         if not os.path.exists(v):
             raise ValueError(f"Error path not found {v}")
         return v
-
- 
-
-
 class ChatPromptTemplate:
 
     def __init__(self, messages: List[Tuple[str, str]]):
-        """Store the messages for later formatting"""
+        """# Store the messages for later formatting"""
         self.messages = messages
 
     def format_prompt(self, **kwargs):
@@ -264,7 +274,7 @@ class AsyncLLM:
                 n_threads=n_threads,
                 n_gpu_layers=n_gpu_layers,
                 verbose=verbose,
-                stop=stop
+                stop=stop,
             )
             
             # Store loaded model
@@ -588,7 +598,7 @@ async def main():
     parser = StrOutputParser()
     cpt=ChatPromptTemplate.from_messages(
      [
-    ("system","you are a helpful assistant hel me in any possible way"),
+    ("system",f"you are a helpful assistant"),
         ("human","{input}")
      ]
     )
@@ -606,10 +616,9 @@ async def main():
     print("="*60)
     
     response = await chain({"input":"What is Python?"})
-     
     print(response)
     
-    # # 6. Multiple users
+    # # # 6. Multiple users
     # print("\n" + "="*60)
     # print("3 USERS CONCURRENTLY")
     # print("="*60)
@@ -623,7 +632,6 @@ async def main():
     
     # for i, r in enumerate(results):
     #     print(f"\nUser {i+1}: {r[:100]}...")
-    
     # 7. Stop service
     await llm.stop()
     
