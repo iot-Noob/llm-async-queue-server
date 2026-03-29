@@ -13,7 +13,22 @@ import uvloop
 from queue import Queue
 import psutil
 import json
+import shutil
+ 
+class EcharrParsers:
 
+    def __init__(self):
+        self.cj:Dict={}
+        cdir=os.getcwd()
+         
+        fp=os.path.join(cdir,"Charts.json")
+        if not os.path.exists(fp):
+            raise ValueError(f"Error file not found Charts.json")
+
+        with open(fp,'r') as f:
+            self.cj=json.load(f,parse_int=3)
+        print(self.cj)
+        pass
 class Runnable:
     """Wrapper that makes any callable chainable with |"""
     def __init__(self, func):
@@ -147,7 +162,7 @@ class AsyncLLM:
         self.path=self.setting.MODEL_PATH
         self.loop=uvloop.new_event_loop()
         self.async_lock=asyncio.Lock()
-        self.queue=asyncio.Queue()
+        self.queue=asyncio.Queue(maxsize=10)
         self._running=False
         self._worker_task=None
         asyncio.set_event_loop(self.loop)
@@ -213,7 +228,9 @@ class AsyncLLM:
             model_name = kwargs.get("model_name")
             if not model_name:
                 raise ValueError("model_name is required")
-            
+            avail = psutil.virtual_memory().available / (1024**2)
+            if avail < 3000:
+                raise MemoryError(f"Need 3GB+ free, have {avail:.0f}MB")
             # Get optional parameters with defaults
             temperature = kwargs.get("temperature", 0.4)
             top_p = kwargs.get("top_p", 0.9)
@@ -289,13 +306,13 @@ class AsyncLLM:
         except Exception as e:
             raise ValueError(f"Error loading model: {e}")
 
-    def run_task(self,tname,**kw):
-        try:
-            if callable(tname):
-                res= self.loop.run_until_complete(tname(**kw))
-                return res
-        except Exception as e:
-            raise ValueError(f"Error run task due to {e}")
+    # def run_task(self,tname,**kw):
+    #     try:
+    #         if callable(tname):
+    #             res= self.loop.run_until_complete(tname(**kw))
+    #             return res
+    #     except Exception as e:
+    #         raise ValueError(f"Error run task due to {e}")
 
     def get_loaded_models(self) -> List[str]:
     
@@ -454,44 +471,100 @@ class AsyncLLM:
         print("👷 Worker started, waiting for tasks...")
         
         while self._running: 
+            task = None  # Define for finally block
             try:
-                parser=StrOutputParser()
-                task = await asyncio.wait_for(self.queue.get(), timeout=60.0)
+                task = await asyncio.wait_for(self.queue.get(), timeout=1.0)
                 
+                # EXTRACT ALL FIELDS FIRST
                 task_id = task["task_id"]
                 prompt = task["prompt"]
                 future = task["future"]
                 
                 print(f"👷 Processing: {task_id}")
 
+                # RAM check AFTER future is defined
+                if psutil.virtual_memory().percent > 88:
+                    future.set_exception(MemoryError("System RAM critical"))
+                    continue  # finally will call task_done
+
                 if not self.current_model:
                     future.set_exception(ValueError("No model loaded"))
-                    self.queue.task_done()
-                    continue
+                    continue  # finally will call task_done
          
                 model = list(self.current_model.values())[0]
-                response = await asyncio.to_thread(model, prompt)
-                pr=parser(response=response)
-
-                result = response.content if hasattr(response, 'content') else str(response)
-                 
-                future.set_result(response)
-                self.queue.task_done() 
+                raw_response = await asyncio.to_thread(model, prompt)
+                
+                # FIX: Actually use parser result
+                parser = StrOutputParser()
+                parsed_result = parser(raw_response)
+                future.set_result(raw_response)
+                
                 print(f"✅ Completed: {task_id}")
               
             except asyncio.TimeoutError:
-                print(f"Timeout on task {task_id}")
-                continue
+                print(f"Worker timeout {task_id}")
+                continue  
             except asyncio.CancelledError:
-                print("Worker cancelled")
+                print(f"Worker cancelled {task_id}")
                 break
             except Exception as e:
                 print(f"❌ Worker error: {e}")
-                if 'future' in locals():
+                # Set exception on future if we have it
+                if 'future' in locals() and not future.done():
                     future.set_exception(e)
-                if 'task' in locals():
+                # NO task_done here - let finally handle it
+            finally:
+                # SINGLE task_done - only if we actually got a task
+                if task is not None:
                     self.queue.task_done()
-    
+                    gc.collect()
+    # async def _worker(self):
+    #     """Background worker - processes queue"""
+    #     print("👷 Worker started, waiting for tasks...")
+        
+    #     while self._running: 
+    #         try:
+    #             parser=StrOutputParser()
+    #             task = await asyncio.wait_for(self.queue.get(), timeout=60.0)
+    #             if psutil.virtual_memory().percent > 95:
+    #                 future.set_exception(MemoryError("System RAM critical"))
+    #                 continue
+    #             task_id = task["task_id"]
+    #             prompt = task["prompt"]
+    #             future = task["future"]
+                
+    #             print(f"👷 Processing: {task_id}")
+
+    #             if not self.current_model:
+    #                 future.set_exception(ValueError("No model loaded"))
+                     
+    #                 continue
+         
+    #             model = list(self.current_model.values())[0]
+    #             response = await asyncio.to_thread(model, prompt)
+    #             pr=parser(response=response)
+
+    #             result = response.content if hasattr(response, 'content') else str(response)
+                 
+    #             future.set_result(response)
+                
+    #             print(f"✅ Completed: {task_id}")
+              
+    #         except asyncio.TimeoutError:
+    #             print(f"Timeout on task {task_id}")
+    #             continue
+    #         except asyncio.CancelledError:
+    #             print("Worker cancelled")
+    #             break
+    #         except Exception as e:
+    #             print(f"❌ Worker error: {e}")
+    #             # if 'future' in locals():
+    #             #     future.set_exception(e)
+    #             # if 'task' in locals():
+    #             #     self.queue.task_done()
+    #         finally:
+    #             self.queue.task_done()
+    #             gc.collect()
     # ========== START METHOD ==========
     async def start(self):
         """Start the worker"""
@@ -519,10 +592,15 @@ class AsyncLLM:
                 pass
             self._worker_task = None
  
-        for task_id, future in self.futures.items():
-            if not future.done():
-                future.set_exception(Exception("Service stopped"))
-        self.futures.clear()
+        # Clear pending futures from queue (not self.futures dict)
+        while not self.queue.empty():
+            try:
+                task = self.queue.get_nowait()
+                future = task.get("future")
+                if future and not future.done():
+                    future.set_exception(Exception("Service stopped"))
+            except:
+                break
         
         print("🛑 Service stopped")
     
@@ -555,7 +633,9 @@ class AsyncLLM:
         except Exception as e:
             print(f"❌ Error in chat: {e}")
             raise
-        
+        finally:
+            self.futures.pop(task_id, None) 
+            print(f"🗑️ [{task_id}] Future cleaned from memory")
     async def ainvoke(self, input: Union[str, Dict]) -> str:
         """Async invoke for chaining"""
         if isinstance(input, dict):
@@ -592,6 +672,7 @@ async def main():
     print("="*60)
     print("ASYNC LLM SERVICE TEST")
     print("="*60)
+    # ecp=EcharrParsers()
     
     # 1. Create service
     llm = AsyncLLM()
