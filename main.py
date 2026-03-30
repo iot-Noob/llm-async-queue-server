@@ -448,7 +448,7 @@ class AsyncLLM:
             self.n_gpu_layers = kwargs.get("n_gpu_layers", -1)
             self.verbose = kwargs.get("verbose", False)
             self.stops = kwargs.get("stop", ["<|endoftext|>", "<|im_end|>"])
-            print("max_token:::")
+           
             # Validate model_name
             if not model_name or not isinstance(model_name, str):
                 raise ValueError(f"Invalid model_name: {model_name}")
@@ -690,12 +690,11 @@ class AsyncLLM:
                 raw_response = await asyncio.to_thread(
                     model, 
                     prompt, 
-                    max_tokens=2048,        # ← ADD THIS
-                    temperature=0.7,        # ← ADD THIS (or get from config)
-                    stop=["<|im_end|>", "User:", "Assistant:", "Human:", "</s>"]  # ← ADD stop tokens
+                    max_tokens=self.n_predict,
+                    temperature=self.temperature,        # ← ADD THIS (or get from config)
+                    stop=self.stops
                 )
-                
-                print("raw_response:::", raw_response)
+                 
                 future.set_result(raw_response)
                 
             except asyncio.TimeoutError:
@@ -706,54 +705,7 @@ class AsyncLLM:
             finally:
                 if task:
                     self.queue.task_done()
-    # async def _worker(self):
-    #     """Background worker - processes queue"""
-    #     print("👷 Worker started, waiting for tasks...")
-        
-    #     while self._running: 
-    #         try:
-    #             parser=StrOutputParser()
-    #             task = await asyncio.wait_for(self.queue.get(), timeout=60.0)
-    #             if psutil.virtual_memory().percent > 95:
-    #                 future.set_exception(MemoryError("System RAM critical"))
-    #                 continue
-    #             task_id = task["task_id"]
-    #             prompt = task["prompt"]
-    #             future = task["future"]
-                
-    #             print(f"👷 Processing: {task_id}")
-
-    #             if not self.current_model:
-    #                 future.set_exception(ValueError("No model loaded"))
-                     
-    #                 continue
-         
-    #             model = list(self.current_model.values())[0]
-    #             response = await asyncio.to_thread(model, prompt)
-    #             pr=parser(response=response)
-
-    #             result = response.content if hasattr(response, 'content') else str(response)
-                 
-    #             future.set_result(response)
-                
-    #             print(f"✅ Completed: {task_id}")
-              
-    #         except asyncio.TimeoutError:
-    #             print(f"Timeout on task {task_id}")
-    #             continue
-    #         except asyncio.CancelledError:
-    #             print("Worker cancelled")
-    #             break
-    #         except Exception as e:
-    #             print(f"❌ Worker error: {e}")
-    #             # if 'future' in locals():
-    #             #     future.set_exception(e)
-    #             # if 'task' in locals():
-    #             #     self.queue.task_done()
-    #         finally:
-    #             self.queue.task_done()
-    #             gc.collect()
-    # ========== START METHOD ==========
+   
     async def start(self):
         """Start the worker"""
         if self._running:
