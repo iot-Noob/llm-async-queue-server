@@ -17,7 +17,7 @@ import shutil
 import re
 from enum import Enum
 class EcharrParsers:
-    def __init__(self):
+    def __init__(self,**kwargs):
         self.cj: Dict = {}
         cdir = os.getcwd()
         # Fix: Initialize as an empty list, not the type 'List[str]'
@@ -33,7 +33,18 @@ class EcharrParsers:
     
         self.all_charts_list = list(self.cj.get("templates", {}).keys())
         self.DEC = Enum('DEC', {key.upper(): key.lower() for key in self.all_charts_list})
-
+        self.temperature = kwargs.get("temperature", 0.1)
+        self.top_p = kwargs.get("top_p", 0.9)
+        self.top_k = kwargs.get("top_k", 30)
+        self.streaming = kwargs.get("streaming", False)
+        self.repeat_penalty = kwargs.get("repeat_penalty",None)
+        self.n_predict = kwargs.get("n_predict", kwargs.get("n_predict", 2048))
+        self.n_batch = kwargs.get("n_batch", 128)
+        self.n_ctx = kwargs.get("n_ctx", 2048)
+        self.n_threads = kwargs.get("n_threads", 6)
+        self.n_gpu_layers = kwargs.get("n_gpu_layers", -1)
+        self.verbose = kwargs.get("verbose", False)
+        self.stops = kwargs.get("stop", ["<|endoftext|>", "<|im_end|>"])
     def get_tool_metadata(self,capitalise=False) -> str:
         """
         Returns a string describing available charts.
@@ -425,19 +436,19 @@ class AsyncLLM:
             if avail < 3000:
                 raise MemoryError(f"Need 3GB+ free, have {avail:.0f}MB")
             # Get optional parameters with defaults
-            temperature = kwargs.get("temperature", 0.1)
-            top_p = kwargs.get("top_p", 0.9)
-            top_k = kwargs.get("top_k", 30)
-            streaming = kwargs.get("streaming", False)
-            repeat_penalty = kwargs.get("repeat_penalty", 1.15)
-            max_tokens = kwargs.get("max_tokens", 1024)
-            n_batch = kwargs.get("n_batch", 128)
-            n_ctx = kwargs.get("n_ctx", 2048)
-            n_threads = kwargs.get("n_threads", 6)
-            n_gpu_layers = kwargs.get("n_gpu_layers", -1)
-            verbose = kwargs.get("verbose", False)
-            stop = kwargs.get("stop", ["<|endoftext|>", "<|im_end|>"])
-            
+            self.temperature = kwargs.get("temperature", 0.1)
+            self.top_p = kwargs.get("top_p", 0.9)
+            self.top_k = kwargs.get("top_k", 30)
+            self.streaming = kwargs.get("streaming", False)
+            self.repeat_penalty = kwargs.get("repeat_penalty",None)
+            self.n_predict = kwargs.get("n_predict", kwargs.get("n_predict", 2048))
+            self.n_batch = kwargs.get("n_batch", 128)
+            self.n_ctx = kwargs.get("n_ctx", 2048)
+            self.n_threads = kwargs.get("n_threads", 6)
+            self.n_gpu_layers = kwargs.get("n_gpu_layers", -1)
+            self.verbose = kwargs.get("verbose", False)
+            self.stops = kwargs.get("stop", ["<|endoftext|>", "<|im_end|>"])
+            print("max_token:::")
             # Validate model_name
             if not model_name or not isinstance(model_name, str):
                 raise ValueError(f"Invalid model_name: {model_name}")
@@ -465,26 +476,26 @@ class AsyncLLM:
                     raise FileNotFoundError(f"Model file '{model_name}' not found in '{self.path}'")
             
             print(f"📦 Loading model: {fmp}")
-            print(f"   Temperature: {temperature}")
-            print(f"   Max tokens: {max_tokens}")
-            print(f"   GPU layers: {n_gpu_layers}")
+            print(f"   Temperature: {self.temperature}")
+            print(f"   Max tokens: {self.n_predict}")
+            print(f"   GPU layers: {self.n_gpu_layers}")
        
             # Load model in thread to avoid blocking
             llm = await asyncio.to_thread(
                 llama_cpp.Llama,
                 model_path=fmp,
-                temperature=temperature,
-                top_p=top_p,
-                top_k=top_k,
-                streaming=streaming,
-                repeat_penalty=repeat_penalty,
-                max_tokens=max_tokens,
-                n_batch=n_batch,
-                n_ctx=n_ctx,
-                n_threads=n_threads,
-                n_gpu_layers=n_gpu_layers,
-                verbose=verbose,
-                stop=stop,
+                temperature=self.temperature,
+                top_p=self.top_p,
+                top_k=self.top_k,
+                streaming=self.streaming,
+                repeat_penalty=self.repeat_penalty,
+                n_predict=self.n_predict,
+                n_batch=self.n_batch,
+                n_ctx=self.n_ctx,
+                n_threads=self.n_threads,
+                n_gpu_layers=self.n_gpu_layers,
+                verbose=self.verbose,
+                stop=self.stops,
             )
             
             # Store loaded model
@@ -674,9 +685,18 @@ class AsyncLLM:
                     continue
                 
                 model = list(self.current_model.values())[0]
-                # Return RAW response - don't parse here
-                raw_response = await asyncio.to_thread(model, prompt)
-                future.set_result(raw_response)  # Raw response
+                
+                # FIX: Pass explicit generation parameters
+                raw_response = await asyncio.to_thread(
+                    model, 
+                    prompt, 
+                    max_tokens=2048,        # ← ADD THIS
+                    temperature=0.7,        # ← ADD THIS (or get from config)
+                    stop=["<|im_end|>", "User:", "Assistant:", "Human:", "</s>"]  # ← ADD stop tokens
+                )
+                
+                print("raw_response:::", raw_response)
+                future.set_result(raw_response)
                 
             except asyncio.TimeoutError:
                 continue
