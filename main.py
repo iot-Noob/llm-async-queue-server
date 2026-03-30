@@ -8,29 +8,143 @@ from langchain.embeddings import Embeddings
 from langchain_community.retrievers import WikipediaRetriever
 from uuid import uuid4
 import asyncio
-from typing import Dict,List,Union,Any,Tuple,Type,TypeVar
+from typing import Dict,List,Union,Any,Tuple,Type,TypeVar,Optional
 import uvloop
 from queue import Queue
 import psutil
 import json
 import shutil
- 
+import re
+from enum import Enum
 class EcharrParsers:
-
     def __init__(self):
-        self.cj:Dict={}
-        cdir=os.getcwd()
-         
-        fp=os.path.join(cdir,"Charts.json")
+        self.cj: Dict = {}
+        cdir = os.getcwd()
+        # Fix: Initialize as an empty list, not the type 'List[str]'
+        self.all_charts_list: List[str] = [] 
+        
+        fp = os.path.join(cdir, "Charts.json")
         if not os.path.exists(fp):
             raise ValueError(f"Error file not found Charts.json")
 
-        with open(fp,'r') as f:
-            self.cj=json.load(f,parse_int=3)
-        print(self.cj)
-        pass
+        with open(fp, 'r') as f:
+            # Note: parse_int=3 is unusual; standard json.load() is safer
+            self.cj = json.load(f)
+    
+        self.all_charts_list = list(self.cj.get("templates", {}).keys())
+        self.DEC = Enum('DEC', {key.upper(): key.lower() for key in self.all_charts_list})
+
+    def get_tool_metadata(self,capitalise=False) -> str:
+        """
+        Returns a string describing available charts.
+        This is what you 'feed' the LLM so it knows its powers.
+        """
+        metadata = []
+        templates = self.cj.get("templates", {})
+        for name, info in templates.items():
+            desc = info.get("description", "No description")
+            metadata.append(f"- {name}: {desc}")
+        return "\n".join(metadata)
+
+    def get_enum_list(self, capitalise: bool = False):
+        """
+        Returns list of chart names.
+        If capitalise=True: returns uppercase names (enum member names)
+        If capitalise=False: returns lowercase values (original keys)
+        """
+        if capitalise:
+            # Return enum member names (already uppercase)
+            return [member.name for member in self.DEC]
+        else:
+            # Return enum member values (original lowercase keys)
+            return [member.value for member in self.DEC]
+        
+    def get_template_placeholders(self, chart_name:'DEC') -> List[str]:
+        """Returns the specific blanks the LLM needs to fill"""
+        template = self.cj.get("templates", {}).get(chart_name)
+        return template.get("placeholders", []) if template else []
+    
+    def get_full_chart_template(self, chart_name: 'DEC') -> Dict[str, Any]:
+        """
+        Returns the ENTIRE JSON block for a specific chart.
+        """
+        # ✅ Correct: Use chart_name.value to get the string key
+        chart_key = chart_name.value if hasattr(chart_name, 'value') else chart_name
+        template = self.cj.get("templates", {}).get(chart_key)
+        
+        if not template:
+            # ✅ Correct formatting
+            raise ValueError(f"Chart '{chart_key}' not found. Available charts: {list(self.cj.get('templates', {}).keys())}")
+        
+        return template
+    
+    def get_dynamic_prompt(self, user_input: str, selected_chart:'DEC'):
+            """
+            Injected Prompt: 
+            Only tells the LLM about the ONE chart it needs to fill.
+            """
+            # 1. Get the specific placeholders for the chosen chart
+            placeholders = self.get_template_placeholders(selected_chart)
+            
+            # 2. Create a string representation of the keys the LLM must return
+            # e.g., '"xAxisData": [...], "seriesData": [...]'
+            placeholder_str = ", ".join([f'"{p}": [...]' for p in placeholders])
+
+            return f"""
+            You are a Data Extraction Bot for the chart: {selected_chart}.
+            
+            REQUIRED KEYS:
+            You must return a JSON object with exactly these keys: {placeholders}
+            
+            USER DATA:
+            {user_input}
+            
+            STRICT OUTPUT FORMAT:
+            {{
+                "chart_name": "{selected_chart}",
+                "data": {{ {placeholder_str} }}
+            }}
+            """
+    def get_full_injection_prompt(self, user_input: str, selected_chart: 'DEC'):
+                full_template = self.get_full_chart_template(selected_chart)
+                
+                return f"""
+                You are a JSON Engineer.
+                
+                TEMPLATE:
+                {json.dumps(full_template["options"])}
+                
+                USER DATA:
+                {user_input}
+                
+                CRITICAL RULES:
+                1. Return the FULL JSON exactly as provided in the TEMPLATE.
+                2. ONLY replace the "{{{{placeholders}}}}" with values from User Data.
+                3. DO NOT add new keys like 'title', 'tooltip', 'legend', or 'color' if they are not in the template.
+                4. If data for a placeholder is missing, return an empty list [].
+                """
+    
+    def get_designer_prompt(self, user_input: str, selected_chart: 'DEC'):
+            full_template = self.get_full_chart_template(selected_chart)
+            
+            return f"""
+            You are a Senior Chart Designer for an ERP system.
+            
+            TEMPLATE:
+            {json.dumps(full_template["options"])}
+            
+            USER DATA: {user_input}
+            
+            DESIGN RULES:
+            1. Fill the "{{{{placeholders}}}}" with the correct data.
+            2. If the user mentions a specific TITLE, add/update the "title": {{"text": "..."}} key.
+            3. If the user mentions a COLOR (e.g., 'make it red'), update the "itemStyle": {{"color": "..."}} inside the series.
+            4. If the user asks for a 'smooth' line, set "smooth": true in the series.
+            
+            STRICT REQUIREMENT: 
+            Only modify keys that exist in the ECharts standard. Do not invent custom keys.
+            """
 class Runnable:
-    """Wrapper that makes any callable chainable with |"""
     def __init__(self, func):
         self.func = func
     
@@ -40,54 +154,64 @@ class Runnable:
             return await result
         return result
     
+    # ADD THESE METHODS:
+    def invoke(self, input_data):
+        """Sync invoke"""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return asyncio.run(self.ainvoke(input_data))
+        else:
+            return loop.run_until_complete(self.ainvoke(input_data))
+    
+    async def ainvoke(self, input_data):
+        """Async invoke"""
+        return await self(input_data)
+    
     def __or__(self, other):
-        # Return a new Runnable that calls self then other
-        ### What it does is get reslut form current function user pass then other instance function or anything pass taht vale to next chain
         async def chained(value):
-            result = await self(value)
-            return await other(result) if asyncio.iscoroutinefunction(other) else other(result)
+            result = await self.ainvoke(value)  # CHANGE: use ainvoke
+            if hasattr(other, 'ainvoke'):
+                return await other.ainvoke(result)
+            elif hasattr(other, 'invoke'):
+                return other.invoke(result)
+            elif callable(other):
+                return await other(result) if asyncio.iscoroutinefunction(other) else other(result)
+            return result
         return Runnable(chained)
 
-
-
-class JsonOutputParser:
-    
-    def __init__(self):
-        pass
-
-    def __call__(self, *args, **kwds):
-        pass
-
-    def __or__(self, value):
-        pass
+ 
 
 class StrOutputParser:
     def parse(self, response):
+        # CHANGE: Return raw string, don't try to parse JSON
         if isinstance(response, str):
-            try:                
-                response = json.loads(response)
-            except json.JSONDecodeError:
-                return response.strip()
+            return response.strip()  # Just strip, don't json.loads
         
         if isinstance(response, dict):
             if "choices" in response and len(response["choices"]) > 0:
                 return response["choices"][0].get("text", "").strip()
             if "text" in response:
                 return response["text"].strip()
+            return json.dumps(response)  # Convert dict to string
         
         return str(response).strip()
+    
+    # ADD these methods for consistency
+    def invoke(self, input_data):
+        return self.parse(input_data)
+    
+    async def ainvoke(self, input_data):
+        return self.parse(input_data)
     
     def __call__(self, response):
         return self.parse(response)
     
     def __or__(self, other):
         def chained(value):
-            parsed = self(value)
+            parsed = self.parse(value)
             return other(parsed) if callable(other) else parsed
         return Runnable(chained)
-    
-    def __ror__(self, other):
-        return self.__or__(other)
     
 
 class Settings(BaseSettings):
@@ -105,6 +229,75 @@ class Settings(BaseSettings):
         if not os.path.exists(v):
             raise ValueError(f"Error path not found {v}")
         return v
+
+class PromptTemplate:
+    def __init__(self, template: str, input_variables: List[str] = None,
+                 partial_variables: Dict[str, Any] = None,
+                 validate_template: bool = True):
+        self.template = template
+        self.partial_variables = partial_variables or {}
+        self.input_variables = input_variables or self._extract_variables(template)
+        self.validate_template = validate_template
+        if validate_template:
+            self._validate()
+
+    def _extract_variables(self, template: str) -> List[str]:
+        
+        return re.findall(r'\{([^{}]+)\}', template)
+
+    def _validate(self):
+        """Check that all input variables are accounted for."""
+        pass
+
+    def format(self, **kwargs) -> str:
+        """Combine partial and passed variables."""
+        all_vars = {**self.partial_variables, **kwargs}
+        if self.validate_template:
+            missing = set(self.input_variables) - set(all_vars)
+            if missing:
+                raise ValueError(f"Missing variables: {missing}")
+        return self.template.format(**all_vars)
+
+    def partial(self, **kwargs):
+        """Return a new template with pre‑filled variables."""
+        new_partials = {**self.partial_variables, **kwargs}
+        return PromptTemplate(
+            template=self.template,
+            partial_variables=new_partials,
+            validate_template=self.validate_template
+        )
+
+    def invoke(self, input_data):
+        """Sync invoke - format prompt"""
+        if isinstance(input_data, dict):
+            return self.format(**input_data)
+        return self.format(input=input_data)
+    
+    async def ainvoke(self, input_data):
+        """Async invoke - format prompt"""
+        return self.invoke(input_data)
+    
+    def __or__(self, other):
+        async def chained(input_data):
+            if isinstance(input_data, dict):
+                prompt = self.format(**input_data)
+            else:
+                prompt = self.format(input=input_data)
+            
+            if hasattr(other, 'ainvoke'):
+                return await other.ainvoke(prompt)
+            elif hasattr(other, 'invoke'):
+                return other.invoke(prompt)
+            elif callable(other):
+                return await other(prompt) if asyncio.iscoroutinefunction(other) else other(prompt)
+            return prompt
+        return Runnable(chained)
+    
+    @classmethod
+    def from_template(cls, template: str):
+        """Convenience constructor."""
+        return cls(template)
+
 class ChatPromptTemplate:
 
     def __init__(self, messages: List[Tuple[str, str]]):
@@ -232,7 +425,7 @@ class AsyncLLM:
             if avail < 3000:
                 raise MemoryError(f"Need 3GB+ free, have {avail:.0f}MB")
             # Get optional parameters with defaults
-            temperature = kwargs.get("temperature", 0.4)
+            temperature = kwargs.get("temperature", 0.1)
             top_p = kwargs.get("top_p", 0.9)
             top_k = kwargs.get("top_k", 30)
             streaming = kwargs.get("streaming", False)
@@ -467,57 +660,32 @@ class AsyncLLM:
     
     # ========== FIXED WORKER ==========
     async def _worker(self):
-        """Background worker - processes queue"""
-        print("👷 Worker started, waiting for tasks...")
-        
-        while self._running: 
-            task = None  # Define for finally block
+        """Background worker - returns RAW response"""
+        while self._running:
+            task = None
             try:
-                task = await asyncio.wait_for(self.queue.get(), timeout=1.0)
-                
-                # EXTRACT ALL FIELDS FIRST
+                task = await asyncio.wait_for(self.queue.get(), timeout=60.0)
                 task_id = task["task_id"]
                 prompt = task["prompt"]
                 future = task["future"]
                 
-                print(f"👷 Processing: {task_id}")
-
-                # RAM check AFTER future is defined
-                if psutil.virtual_memory().percent > 88:
-                    future.set_exception(MemoryError("System RAM critical"))
-                    continue  # finally will call task_done
-
                 if not self.current_model:
                     future.set_exception(ValueError("No model loaded"))
-                    continue  # finally will call task_done
-         
+                    continue
+                
                 model = list(self.current_model.values())[0]
+                # Return RAW response - don't parse here
                 raw_response = await asyncio.to_thread(model, prompt)
+                future.set_result(raw_response)  # Raw response
                 
-                # FIX: Actually use parser result
-                parser = StrOutputParser()
-                parsed_result = parser(raw_response)
-                future.set_result(raw_response)
-                
-                print(f"✅ Completed: {task_id}")
-              
             except asyncio.TimeoutError:
-                print(f"Worker timeout {task_id}")
-                continue  
-            except asyncio.CancelledError:
-                print(f"Worker cancelled {task_id}")
-                break
+                continue
             except Exception as e:
-                print(f"❌ Worker error: {e}")
-                # Set exception on future if we have it
-                if 'future' in locals() and not future.done():
+                if task and 'future' in locals() and not future.done():
                     future.set_exception(e)
-                # NO task_done here - let finally handle it
             finally:
-                # SINGLE task_done - only if we actually got a task
-                if task is not None:
+                if task:
                     self.queue.task_done()
-                    gc.collect()
     # async def _worker(self):
     #     """Background worker - processes queue"""
     #     print("👷 Worker started, waiting for tasks...")
@@ -608,6 +776,7 @@ class AsyncLLM:
     async def chat_llm(self, chat: str) -> str:
         """Send a message to the LLM"""
         try:
+            task_id=None
             if not self.current_model:
                 raise ValueError("No model loaded. Call _load_model() first.")
             
@@ -645,14 +814,32 @@ class AsyncLLM:
         return await self.chat_llm(prompt)
     
     def invoke(self, input: Union[str, Dict]) -> str:
-        """Sync invoke"""
-     
-        return asyncio.run(self.ainvoke(input))
+        """Sync invoke - runs LLM"""
+        if isinstance(input, dict):
+            prompt = input.get("input", str(input))
+        else:
+            prompt = str(input)
+        
+        try:
+            # Try to run in existing loop
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            # No running loop, create new one
+            return asyncio.run(self.chat_llm(prompt))
+        else:
+            # Already in async context
+            return loop.run_until_complete(self.chat_llm(prompt))
     
     def __or__(self, other):
         async def chained(value):
-            response = await self(value)   # calls __call__
-            return await other(response) if asyncio.iscoroutinefunction(other) else other(response)
+            response = await self.ainvoke(value)  # Use ainvoke
+            if hasattr(other, 'ainvoke'):
+                return await other.ainvoke(response)
+            elif hasattr(other, 'invoke'):
+                return other.invoke(response)
+            elif callable(other):
+                return await other(response) if asyncio.iscoroutinefunction(other) else other(response)
+            return response
         return Runnable(chained)
     
     def __ror__(self, other):
@@ -666,60 +853,3 @@ class AsyncLLM:
     async def __call__(self, input: Union[str, Dict]) -> str:
         """Make the instance callable directly"""
         return await self.ainvoke(input)
-    
-# ========== CORRECT USAGE ==========
-async def main():
-    print("="*60)
-    print("ASYNC LLM SERVICE TEST")
-    print("="*60)
-    # ecp=EcharrParsers()
-    
-    # 1. Create service
-    llm = AsyncLLM()
-    parser = StrOutputParser()
-    cpt=ChatPromptTemplate.from_messages(
-     [
-    ("system",f"you are a helpful assistant"),
-        ("human","{input}")
-     ]
-    )
-    # 2. Load model (MUST AWAIT!)
-    await llm._load_model(model_name="glm-4-9b-chat-IQ4_XS.gguf")
-    
-    # 3. Start the worker
-    await llm.start()
-    
-    # 4. Create chain (function that calls llm then parser)
-    chain = cpt | llm  |parser
-    # 5. Chat with the LLM
-    print("\n" + "="*60)
-    print("CHATTING...")
-    print("="*60)
-    
-    response = await chain({"input":"What is Python?"})
-    print(response)
-    
-    # # # 6. Multiple users
-    # print("\n" + "="*60)
-    # print("3 USERS CONCURRENTLY")
-    # print("="*60)
-    
-    # results = await asyncio.gather(
-    #     chain({"input":"Tell me a joke"}),
-    #     chain({"input":"Explain async programming"}),
-    #     chain({"input":"Write a short essay on Pakistani village life"}),
-    #     chain({"input":"What is machine learning?"})
-    # )
-    
-    # for i, r in enumerate(results):
-    #     print(f"\nUser {i+1}: {r[:100]}...")
-    # 7. Stop service
-    await llm.stop()
-    
-    # 8. Unload model
-    llm.unload_model("glm-4-9b-chat-IQ4_XS.gguf")
-    
-    print("\n✅ All done!")
-
-if __name__ == "__main__":
-    asyncio.run(main())
