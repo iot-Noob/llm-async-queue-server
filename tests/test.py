@@ -1,3 +1,9 @@
+import os
+import sys
+# Add parent directory to path so Python can find main.py
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+
 from main import ChatPromptTemplate,PromptTemplate,AsyncLLM,StrOutputParser
 import asyncio
 async def main():
@@ -14,7 +20,7 @@ async def main():
     pt=PromptTemplate(template="you are a helpful assistant help me in any way with input {input}",input_variables=["input"])
     chain=pt | llm | parser
     res=await chain.ainvoke({"input":"hi is it true you cant make TNT at home"})
-    print(res)
+    print(res.name)
     llm.stop()
     llm.unload_all_models()
  

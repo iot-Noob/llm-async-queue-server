@@ -1,0 +1,376 @@
+{
+  "version": "1.0",
+  "description": "ECharts template library for AI data filling",
+  "templates": {
+    "basic_line_chart": {
+      "description": "Simple line chart with category x-axis",
+      "options": {
+        "xAxis": {
+          "type": "category",
+          "data": "{{xAxisData}}"
+        },
+        "yAxis": {
+          "type": "value"
+        },
+        "series": [
+          {
+            "data": "{{seriesData}}",
+            "type": "line"
+          }
+        ]
+      },
+      "placeholders": ["xAxisData", "seriesData"]
+    },
+    
+    "basic_bar_chart": {
+      "description": "Simple bar chart",
+      "options": {
+        "xAxis": {
+          "type": "category",
+          "data": "{{xAxisData}}"
+        },
+        "yAxis": {
+          "type": "value"
+        },
+        "series": [
+          {
+            "data": "{{seriesData}}",
+            "type": "bar"
+          }
+        ]
+      },
+      "placeholders": ["xAxisData", "seriesData"]
+    },
+    
+    "smooth_line_chart": {
+      "description": "Line chart with smooth curve",
+      "options": {
+        "xAxis": {
+          "type": "category",
+          "data": "{{xAxisData}}"
+        },
+        "yAxis": {
+          "type": "value"
+        },
+        "series": [
+          {
+            "data": "{{seriesData}}",
+            "type": "line",
+            "smooth": true
+          }
+        ]
+      },
+      "placeholders": ["xAxisData", "seriesData"]
+    },
+    
+    "area_chart": {
+      "description": "Basic area chart",
+      "options": {
+        "xAxis": {
+          "type": "category",
+          "boundaryGap": false,
+          "data": "{{xAxisData}}"
+        },
+        "yAxis": {
+          "type": "value"
+        },
+        "series": [
+          {
+            "data": "{{seriesData}}",
+            "type": "line",
+            "areaStyle": {}
+          }
+        ]
+      },
+      "placeholders": ["xAxisData", "seriesData"]
+    },
+    
+    "pie_chart": {
+      "description": "Basic pie chart",
+      "options": {
+        "tooltip": {
+          "trigger": "item"
+        },
+        "legend": {
+          "orient": "vertical",
+          "left": "left"
+        },
+        "series": [
+          {
+            "name": "{{seriesName}}",
+            "type": "pie",
+            "radius": "50%",
+            "data": "{{pieData}}",
+            "emphasis": {
+              "scale": true
+            }
+          }
+        ]
+      },
+      "placeholders": ["seriesName", "pieData"]
+    },
+    
+    "scatter_chart": {
+      "description": "Scatter plot",
+      "options": {
+        "xAxis": {
+          "type": "value"
+        },
+        "yAxis": {
+          "type": "value"
+        },
+        "series": [
+          {
+            "name": "{{seriesName}}",
+            "type": "scatter",
+            "data": "{{pointsData}}",
+            "symbolSize": "{{symbolSize}}"
+          }
+        ]
+      },
+      "placeholders": ["seriesName", "pointsData", "symbolSize"]
+    },
+    
+    "stacked_line_chart": {
+      "description": "Stacked line chart with multiple series",
+      "options": {
+        "title": {
+          "text": "{{title}}"
+        },
+        "tooltip": {
+          "trigger": "axis"
+        },
+        "legend": {
+          "data": "{{legendData}}"
+        },
+        "grid": {
+          "left": "3%",
+          "right": "4%",
+          "bottom": "3%",
+          "containLabel": true
+        },
+        "xAxis": {
+          "type": "category",
+          "boundaryGap": false,
+          "data": "{{xAxisData}}"
+        },
+        "yAxis": {
+          "type": "value"
+        },
+        "series": "{{seriesArray}}"
+      },
+      "placeholders": ["title", "legendData", "xAxisData", "seriesArray"]
+    },
+    
+    "gauge_chart": {
+      "description": "Gauge chart for single value",
+      "options": {
+        "series": [
+          {
+            "type": "gauge",
+            "min": "{{minValue}}",
+            "max": "{{maxValue}}",
+            "detail": {
+              "valueAnimation": true
+            },
+            "data": [
+              {
+                "value": "{{currentValue}}",
+                "name": "{{valueName}}"
+              }
+            ]
+          }
+        ]
+      },
+      "placeholders": ["minValue", "maxValue", "currentValue", "valueName"]
+    },
+    
+    "radar_chart": {
+      "description": "Radar/Spider chart",
+      "options": {
+        "radar": {
+          "indicator": "{{indicators}}"
+        },
+        "series": [
+          {
+            "type": "radar",
+            "data": "{{seriesData}}"
+          }
+        ]
+      },
+      "placeholders": ["indicators", "seriesData"]
+    },
+    
+    "candlestick_chart": {
+      "description": "Candlestick chart for stock data",
+      "options": {
+        "xAxis": {
+          "type": "category",
+          "data": "{{dates}}"
+        },
+        "yAxis": {
+          "type": "value"
+        },
+        "series": [
+          {
+            "name": "{{seriesName}}",
+            "type": "candlestick",
+            "data": "{{ohlcData}}"
+          }
+        ]
+      },
+      "placeholders": ["dates", "seriesName", "ohlcData"]
+    },
+    
+    "heatmap_chart": {
+      "description": "Heatmap chart",
+      "options": {
+        "xAxis": {
+          "type": "category",
+          "data": "{{xCategories}}"
+        },
+        "yAxis": {
+          "type": "category",
+          "data": "{{yCategories}}"
+        },
+        "visualMap": {
+          "min": "{{minValue}}",
+          "max": "{{maxValue}}"
+        },
+        "series": [
+          {
+            "type": "heatmap",
+            "data": "{{heatmapData}}"
+          }
+        ]
+      },
+      "placeholders": ["xCategories", "yCategories", "minValue", "maxValue", "heatmapData"]
+    },
+    
+    "graph_chart": {
+      "description": "Network/Graph chart",
+      "options": {
+        "series": [
+          {
+            "type": "graph",
+            "layout": "{{layout}}",
+            "roam": true,
+            "nodes": "{{nodes}}",
+            "links": "{{links}}"
+          }
+        ]
+      },
+      "placeholders": ["layout", "nodes", "links"]
+    },
+    
+    "treemap_chart": {
+      "description": "Treemap for hierarchical data",
+      "options": {
+        "series": [
+          {
+            "type": "treemap",
+            "data": "{{treeData}}"
+          }
+        ]
+      },
+      "placeholders": ["treeData"]
+    },
+    
+    "funnel_chart": {
+      "description": "Funnel chart",
+      "options": {
+        "series": [
+          {
+            "type": "funnel",
+            "data": "{{funnelData}}"
+          }
+        ]
+      },
+      "placeholders": ["funnelData"]
+    },
+    
+    "parallel_chart": {
+      "description": "Parallel coordinates chart",
+      "options": {
+        "parallelAxis": "{{parallelAxes}}",
+        "series": [
+          {
+            "type": "parallel",
+            "data": "{{parallelData}}"
+          }
+        ]
+      },
+      "placeholders": ["parallelAxes", "parallelData"]
+    },
+    
+    "sankey_chart": {
+      "description": "Sankey diagram for flow data",
+      "options": {
+        "series": [
+          {
+            "type": "sankey",
+            "layout": "none",
+            "data": "{{nodes}}",
+            "links": "{{links}}"
+          }
+        ]
+      },
+      "placeholders": ["nodes", "links"]
+    },
+    
+    "sunburst_chart": {
+      "description": "Sunburst chart for hierarchical data",
+      "options": {
+        "series": [
+          {
+            "type": "sunburst",
+            "radius": "0-90%",
+            "data": "{{hierarchicalData}}"
+          }
+        ]
+      },
+      "placeholders": ["hierarchicalData"]
+    },
+    
+    "boxplot_chart": {
+      "description": "Boxplot chart for statistical data",
+      "options": {
+        "xAxis": {
+          "type": "category",
+          "data": "{{categories}}"
+        },
+        "yAxis": {
+          "type": "value"
+        },
+        "series": [
+          {
+            "type": "boxplot",
+            "data": "{{boxData}}"
+          }
+        ]
+      },
+      "placeholders": ["categories", "boxData"]
+    },
+    
+    "calendar_chart": {
+      "description": "Calendar heatmap chart",
+      "options": {
+        "visualMap": {
+          "min": "{{minValue}}",
+          "max": "{{maxValue}}"
+        },
+        "calendar": {
+          "range": "{{dateRange}}"
+        },
+        "series": [
+          {
+            "type": "heatmap",
+            "coordinateSystem": "calendar",
+            "data": "{{calendarData}}"
+          }
+        ]
+      },
+      "placeholders": ["minValue", "maxValue", "dateRange", "calendarData"]
+    }
+  }
+}

@@ -1,5 +1,6 @@
 import llama_cpp
 from pydantic import BaseModel, Field,field_validator,ConfigDict,ValidationError
+from pydantic import ValidationError as PydanticValidationError
 from pydantic_settings import BaseSettings
 import gc
 import ctypes
@@ -8,8 +9,7 @@ from langchain.embeddings import Embeddings
 from langchain_community.retrievers import WikipediaRetriever
 from uuid import uuid4
 import asyncio
-from typing import Dict,List,Union,Any,Tuple,Type,TypeVar,Optional
-import uvloop
+from typing import Dict,List,Union,Any,Tuple,Type,TypeVar,Optional,Generic
 from queue import Queue
 import psutil
 import json
@@ -24,16 +24,19 @@ class EcharrParsers:
         cdir = os.getcwd()
         # Fix: Initialize as an empty list, not the type 'List[str]'
         self.all_charts_list: List[str] = [] 
-        self.all_charts_list = list(self.cj.get("templates", {}).keys())
+       
         self.DEC = Enum('DEC', {key.upper(): key.lower() for key in self.all_charts_list})
         fp = os.path.join(cdir, "Charts.json")
         if not os.path.exists(fp):
             raise ValueError(f"Error file not found Charts.json")
-
         with open(fp, 'r') as f:
-            # Note: parse_int=3 is unusual; standard json.load() is safer
             self.cj = json.load(f)
-    
+                
+            # 2. Extract the keys into the list
+            self.all_charts_list = list(self.cj.get("templates", {}).keys())
+            # 3. Create the Enum LAST using the populated list
+            # Using the Functional API (Enum) or the type() method you liked:
+            self.DEC = Enum('DEC', {key.upper(): key for key in self.all_charts_list})
 
         """
         Returns a string describing available charts.
@@ -44,7 +47,7 @@ class EcharrParsers:
         for name, info in templates.items():
             desc = info.get("description", "No description")
             metadata.append(f"- {name}: {desc}")
-        return "\n".join(metadata)
+       
 
     def get_enum_list(self, capitalise: bool = False):
         """
@@ -144,6 +147,7 @@ class EcharrParsers:
             STRICT REQUIREMENT: 
             Only modify keys that exist in the ECharts standard. Do not invent custom keys.
             """
+
 class Runnable:
     def __init__(self, func):
         self.func = func
@@ -168,18 +172,26 @@ class Runnable:
         """Async invoke"""
         return await self(input_data)
     
+    # def __or__(self, other):
+    #     async def chained(value):
+    #         result = await self.ainvoke(value)  # CHANGE: use ainvoke
+    #         if hasattr(other, 'ainvoke'):
+    #             return await other.ainvoke(result)
+    #         elif hasattr(other, 'invoke'):
+    #             return other.invoke(result)
+    #         elif callable(other):
+    #             return await other(result) if asyncio.iscoroutinefunction(other) else other(result)
+    #         return result
+    #     return Runnable(chained)
     def __or__(self, other):
         async def chained(value):
-            result = await self.ainvoke(value)  # CHANGE: use ainvoke
-            if hasattr(other, 'ainvoke'):
-                return await other.ainvoke(result)
-            elif hasattr(other, 'invoke'):
-                return other.invoke(result)
+            result = await self.ainvoke(value)
+            if asyncio.iscoroutinefunction(other):
+                return await other(result)
             elif callable(other):
-                return await other(result) if asyncio.iscoroutinefunction(other) else other(result)
+                return other(result)
             return result
         return Runnable(chained)
-
  
 
 class StrOutputParser:
@@ -345,6 +357,95 @@ class ChatPromptTemplate:
     def from_template(cls, template: str):
         """Create simple template from one string"""
         return cls([("human", template)])
+
+T = TypeVar('T', bound=BaseModel)
+
+class JsonOutputParser:
+    """
+    LangChain-style JSON Output Parser.
+    Extracts JSON from LLM responses, handles markdown code blocks, and returns dict.
+    """
+    
+    def __init__(self, pydantic_object: Optional[Type[BaseModel]] = None):
+        """
+        Args:
+            pydantic_object: Optional Pydantic model for validation.
+                            If provided, returns validated model instead of dict.
+        """
+        self.pydantic_object = pydantic_object
+    
+    def parse(self, response):
+        """Parse raw LLM response into JSON/dict"""
+        import re
+        
+        if isinstance(response, str):
+            text = response.strip()
+            
+            # Remove markdown code blocks - same regex pattern LangChain uses [citation:1]
+            # Pattern: ```json ... ``` or ``` ... ```
+            match = re.search(r'```(?:json)?\s*(.*?)\s*```', text, re.DOTALL)
+            if match:
+                text = match.group(1).strip()
+            
+            # Try to find JSON directly if no markdown blocks
+            else:
+                json_match = re.search(r'\{.*\}', text, re.DOTALL)
+                if json_match:
+                    text = json_match.group()
+            
+            # Parse JSON
+            try:
+                parsed = json.loads(text)
+            except json.JSONDecodeError as e:
+                raise ValueError(f"Failed to parse JSON: {e}\nResponse: {text[:200]}")
+            
+            # Validate with Pydantic if provided [citation:5][citation:8]
+            if self.pydantic_object:
+                try:
+                    return self.pydantic_object(**parsed)
+                except PydanticValidationError as e:
+                    raise ValueError(f"Pydantic validation failed: {e}")
+            return parsed
+        
+        elif isinstance(response, dict):
+            if self.pydantic_object:
+                return self.pydantic_object(**response)
+            return response
+        
+        return response
+    
+    def get_format_instructions(self) -> str:
+        """Return formatting instructions for the LLM - similar to LangChain's [citation:5]"""
+        if self.pydantic_object:
+            schema = self.pydantic_object.model_json_schema()
+            return f"""Respond with a valid JSON object matching this schema:
+{json.dumps(schema, indent=2)}"""
+        return "Respond with a valid JSON object. Do not include any explanatory text."
+    
+    def invoke(self, input_data):
+        return self.parse(input_data)
+    
+    async def ainvoke(self, input_data):
+        return self.parse(input_data)
+    
+    def __call__(self, response):
+        return self.parse(response)
+
+
+class PydanticOutputParser(JsonOutputParser, Generic[T]):
+    """
+    LangChain-style Pydantic Output Parser.
+    Parses LLM output directly into a Pydantic model [citation:5].
+    """
+    
+    def __init__(self, pydantic_object: Type[T]):
+        super().__init__(pydantic_object=pydantic_object)
+        self.pydantic_object = pydantic_object
+    
+    def parse(self, response):
+        """Parse and return validated Pydantic model"""
+        return super().parse(response)
+
 class AsyncLLM:
  
     def __init__(self, ** kwargs):
@@ -353,7 +454,7 @@ class AsyncLLM:
         self.current_model:Dict[str,llama_cpp.Llama]={}
         self.setting=Settings()
         self.path=self.setting.MODEL_PATH
-        self.loop=uvloop.new_event_loop()
+ 
         self.async_lock=asyncio.Lock()
         self.queue=asyncio.Queue(maxsize=10)
         self._running=False
@@ -371,9 +472,8 @@ class AsyncLLM:
         self.n_gpu_layers = kwargs.get("n_gpu_layers", -1)
         self.verbose = kwargs.get("verbose", False)
         self.stops = kwargs.get("stop", ["<|endoftext|>", "<|im_end|>"])
-
-    def get_tool_metadata(self,capitalise=False) -> str:
-        asyncio.set_event_loop(self.loop)
+        self.output_parser = kwargs.get("output_parser", StrOutputParser())
+ 
 
     async def _get_model_in_current_dirs(self):
         """Get all .gguf models in directory"""
@@ -521,7 +621,7 @@ class AsyncLLM:
     #             return res
     #     except Exception as e:
     #         raise ValueError(f"Error run task due to {e}")
-
+ 
     def get_loaded_models(self) -> List[str]:
     
         """
@@ -673,13 +773,33 @@ class AsyncLLM:
             "model_names": list(self.current_model.keys())
         }
     
-    # ========== FIXED WORKER ==========
+    
+    def _parse_raw_response(self, raw_response):
+        """
+        LangChain‑style parsing of the raw LLM response.
+        Uses the configured output_parser to convert the raw response to a string.
+        Falls back to _extract_response_text if the parser fails.
+        """
+        try:
+            # If the parser has a parse method (like StrOutputParser)
+            if hasattr(self.output_parser, 'parse'):
+                return self.output_parser.parse(raw_response)
+            # If it's a callable
+            elif callable(self.output_parser):
+                return self.output_parser(raw_response)
+            else:
+                raise ValueError("output_parser not callable and has no parse method")
+        except Exception as e:
+            # Fallback to the safe extraction method
+            print(f"⚠️ Parser failed, using fallback: {e}")
+            return self._extract_response_text(raw_response)
+        
     async def _worker(self):
-        """Background worker - returns RAW response"""
+        """Background worker - robust response handling"""
         while self._running:
             task = None
             try:
-                task = await asyncio.wait_for(self.queue.get(), timeout=60.0)
+                task = await asyncio.wait_for(self.queue.get(), timeout=1.0)
                 task_id = task["task_id"]
                 prompt = task["prompt"]
                 future = task["future"]
@@ -689,9 +809,10 @@ class AsyncLLM:
                     continue
                 
                 model = list(self.current_model.values())[0]
-                 
-                # llm(top_p=,top_k=,stream=,repeat_penalty=,)
-                # FIX: Pass explicit generation parameters
+                
+                print(f"⚙️ [{task_id}] Processing: {prompt[:50]}...")
+                
+                # Run inference
                 raw_response = await asyncio.to_thread(
                     model, 
                     prompt, 
@@ -699,21 +820,31 @@ class AsyncLLM:
                     temperature=self.temperature,
                     top_p=self.top_p,
                     top_k=self.top_k,
-                    stream=self.streaming,
-                     
+                    # Remove stream if you don't handle it
+                    # stream=self.streaming,  
                 )
-                 
-                future.set_result(raw_response)
+                
+                # SAFE EXTRACTION
+                text_output = self._parse_raw_response(raw_response)
+                
+                if not future.done():
+                    future.set_result(text_output)
+                
+                print(f"✅ [{task_id}] Completed")
                 
             except asyncio.TimeoutError:
                 continue
+            except asyncio.CancelledError:
+                print("Worker cancelled")
+                break
             except Exception as e:
-                if task and 'future' in locals() and not future.done():
-                    future.set_exception(e)
+                print(f"❌ Worker error: {e}")
+                # Only set exception if future exists and not done
+                if task and 'future' in task and not task['future'].done():
+                    task['future'].set_exception(e)
             finally:
                 if task:
-                    self.queue.task_done()
-   
+                    self.queue.task_done() 
     async def start(self):
         """Start the worker"""
         if self._running:
