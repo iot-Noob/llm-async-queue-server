@@ -16,13 +16,16 @@ import json
 import shutil
 import re
 from enum import Enum
+
+
 class EcharrParsers:
-    def __init__(self,**kwargs):
+    def __init__(self):
         self.cj: Dict = {}
         cdir = os.getcwd()
         # Fix: Initialize as an empty list, not the type 'List[str]'
         self.all_charts_list: List[str] = [] 
-        
+        self.all_charts_list = list(self.cj.get("templates", {}).keys())
+        self.DEC = Enum('DEC', {key.upper(): key.lower() for key in self.all_charts_list})
         fp = os.path.join(cdir, "Charts.json")
         if not os.path.exists(fp):
             raise ValueError(f"Error file not found Charts.json")
@@ -31,21 +34,7 @@ class EcharrParsers:
             # Note: parse_int=3 is unusual; standard json.load() is safer
             self.cj = json.load(f)
     
-        self.all_charts_list = list(self.cj.get("templates", {}).keys())
-        self.DEC = Enum('DEC', {key.upper(): key.lower() for key in self.all_charts_list})
-        self.temperature = kwargs.get("temperature", 0.1)
-        self.top_p = kwargs.get("top_p", 0.9)
-        self.top_k = kwargs.get("top_k", 30)
-        self.streaming = kwargs.get("streaming", False)
-        self.repeat_penalty = kwargs.get("repeat_penalty",None)
-        self.n_predict = kwargs.get("n_predict", kwargs.get("n_predict", 2048))
-        self.n_batch = kwargs.get("n_batch", 128)
-        self.n_ctx = kwargs.get("n_ctx", 2048)
-        self.n_threads = kwargs.get("n_threads", 6)
-        self.n_gpu_layers = kwargs.get("n_gpu_layers", -1)
-        self.verbose = kwargs.get("verbose", False)
-        self.stops = kwargs.get("stop", ["<|endoftext|>", "<|im_end|>"])
-    def get_tool_metadata(self,capitalise=False) -> str:
+
         """
         Returns a string describing available charts.
         This is what you 'feed' the LLM so it knows its powers.
@@ -358,7 +347,7 @@ class ChatPromptTemplate:
         return cls([("human", template)])
 class AsyncLLM:
  
-    def __init__(self):
+    def __init__(self, ** kwargs):
        
         self.futures:Dict[str,asyncio.Future]={}    
         self.current_model:Dict[str,llama_cpp.Llama]={}
@@ -369,6 +358,21 @@ class AsyncLLM:
         self.queue=asyncio.Queue(maxsize=10)
         self._running=False
         self._worker_task=None
+
+        self.temperature = kwargs.get("temperature", 0.1)
+        self.top_p = kwargs.get("top_p", 0.9)
+        self.top_k = kwargs.get("top_k", 30)
+        self.streaming = kwargs.get("streaming", False)
+        self.repeat_penalty = kwargs.get("repeat_penalty",None)
+        self.n_predict = kwargs.get("n_predict", kwargs.get("n_predict", 2048))
+        self.n_batch = kwargs.get("n_batch", 128)
+        self.n_ctx = kwargs.get("n_ctx", 2048)
+        self.n_threads = kwargs.get("n_threads", 6)
+        self.n_gpu_layers = kwargs.get("n_gpu_layers", -1)
+        self.verbose = kwargs.get("verbose", False)
+        self.stops = kwargs.get("stop", ["<|endoftext|>", "<|im_end|>"])
+
+    def get_tool_metadata(self,capitalise=False) -> str:
         asyncio.set_event_loop(self.loop)
 
     async def _get_model_in_current_dirs(self):
@@ -583,7 +587,7 @@ class AsyncLLM:
             return False
 
     def _unload_single_model(self, model_name: str) -> bool:
-        """
+        """(
         Internal method to unload a single model.
         
         Args:
@@ -685,14 +689,18 @@ class AsyncLLM:
                     continue
                 
                 model = list(self.current_model.values())[0]
-                
+                 
+                # llm(top_p=,top_k=,stream=,repeat_penalty=,)
                 # FIX: Pass explicit generation parameters
                 raw_response = await asyncio.to_thread(
                     model, 
                     prompt, 
                     max_tokens=self.n_predict,
-                    temperature=self.temperature,        # ← ADD THIS (or get from config)
-                    stop=self.stops
+                    temperature=self.temperature,
+                    top_p=self.top_p,
+                    top_k=self.top_k,
+                    stream=self.streaming,
+                     
                 )
                  
                 future.set_result(raw_response)
