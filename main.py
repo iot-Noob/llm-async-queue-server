@@ -24,20 +24,20 @@ class EcharrParsers:
         cdir = os.getcwd()
         # Fix: Initialize as an empty list, not the type 'List[str]'
         self.all_charts_list: List[str] = [] 
-       
-        self.DEC = Enum('DEC', {key.upper(): key.lower() for key in self.all_charts_list})
         fp = os.path.join(cdir, "Charts.json")
         if not os.path.exists(fp):
             raise ValueError(f"Error file not found Charts.json")
-        with open(fp, 'r') as f:
-            self.cj = json.load(f)
-                
-            # 2. Extract the keys into the list
+        try:
+            with open(fp, 'r') as f:
+                self.cj = json.load(f)
             self.all_charts_list = list(self.cj.get("templates", {}).keys())
-            # 3. Create the Enum LAST using the populated list
-            # Using the Functional API (Enum) or the type() method you liked:
-            self.DEC = Enum('DEC', {key.upper(): key for key in self.all_charts_list})
-
+        except json.JSONDecodeError as je:
+            raise ValueError(f"Error invalid json  in echart{je}")
+            # 2. Extract the keys into the list
+        
+        # 3. Create the Enum LAST using the populated list
+        # Using the Functional API (Enum) or the type() method you liked:
+        self.DEC = Enum('DEC', {key.upper(): key for key in self.all_charts_list})
         """
         Returns a string describing available charts.
         This is what you 'feed' the LLM so it knows its powers.
@@ -449,11 +449,20 @@ class PydanticOutputParser(JsonOutputParser, Generic[T]):
 class AsyncLLM:
  
     def __init__(self, ** kwargs):
-       
+        self.setting=Settings()
+        self.model_path=kwargs.get("model_path")
+        self._worker_exception_callback = kwargs.get("worker_exception_callback", None)
+        self._auto_restart_worker = kwargs.get("auto_restart_worker", False)
         self.futures:Dict[str,asyncio.Future]={}    
         self.current_model:Dict[str,llama_cpp.Llama]={}
-        self.setting=Settings()
-        self.path=self.setting.MODEL_PATH
+        if self.model_path:
+            self.path=self.model_path
+        else:
+            try:
+                self.path=self.setting.MODEL_PATH
+            except ValidationError as ve:
+                raise ValueError(f"MODEL_PATH not set. Provide it via .env or pass model_path argument.") from ve
+        
  
         self.async_lock=asyncio.Lock()
         self.queue=asyncio.Queue(maxsize=10)
@@ -615,13 +624,38 @@ class AsyncLLM:
             raise ValueError(f"Error loading model: {e}")
 
     # def run_task(self,tname,**kw):
-    #     try:
+    #     try:f
     #         if callable(tname):
     #             res= self.loop.run_until_complete(tname(**kw))
     #             return res
     #     except Exception as e:
     #         raise ValueError(f"Error run task due to {e}")
- 
+
+
+    def _worker_done_callback(self, task):
+            """Handle worker task completion and exceptions"""
+            if task.cancelled():
+                print("⚠️ Worker task was cancelled")
+                return
+            
+            exception = task.exception()
+            if exception:
+                print(f"❌ Worker task crashed with exception: {exception}")
+                import traceback
+                traceback.print_exception(type(exception), exception, exception.__traceback__)
+                
+                # Call custom callback if provided
+                if self._worker_exception_callback:
+                    try:
+                        self._worker_exception_callback(exception)
+                    except Exception as e:
+                        print(f"⚠️ Exception callback failed: {e}")
+                
+                # Optional: Auto-restart worker
+                if hasattr(self, '_auto_restart_worker') and self._auto_restart_worker:
+                    print("🔄 Auto-restarting worker...")
+                    self._worker_task = asyncio.create_task(self._worker())
+                    self._worker_task.add_done_callback(self._worker_done_callback)
     def get_loaded_models(self) -> List[str]:
     
         """
@@ -772,8 +806,23 @@ class AsyncLLM:
             "models_loaded": len(self.current_model),
             "model_names": list(self.current_model.keys())
         }
-    
-    
+        
+    def _extract_response_text(self, response):
+        """Fallback extraction when parser fails"""
+        try:
+            if isinstance(response, str):
+                return response.strip()
+            elif isinstance(response, dict):
+                if "choices" in response and response["choices"]:
+                    choice = response["choices"][0]
+                    if "text" in choice:
+                        return choice["text"].strip()
+                    if "message" in choice and "content" in choice["message"]:
+                        return choice["message"]["content"].strip()
+                return json.dumps(response)
+            return str(response)
+        except Exception as e:
+            return f"[Error extracting response: {e}]"
     def _parse_raw_response(self, raw_response):
         """
         LangChain‑style parsing of the raw LLM response.
@@ -823,7 +872,16 @@ class AsyncLLM:
                     # Remove stream if you don't handle it
                     # stream=self.streaming,  
                 )
-                
+                if isinstance(raw_response, dict) and "choices" in raw_response:
+                    choice = raw_response["choices"][0]
+                    finish_reason = choice.get("finish_reason")
+                    
+                    if finish_reason == "length":
+                        print(f"⚠️ [{task_id}] Stopped due to max_tokens limit ({self.n_predict})")
+                    elif finish_reason == "stop":
+                        print(f"✅ [{task_id}] Stopped by stop token")
+                    elif finish_reason:
+                        print(f"ℹ️ [{task_id}] Finish reason: {finish_reason}")
                 # SAFE EXTRACTION
                 text_output = self._parse_raw_response(raw_response)
                 
@@ -853,6 +911,7 @@ class AsyncLLM:
         
         self._running = True
         self._worker_task = asyncio.create_task(self._worker())
+        self._worker_task.add_done_callback(self._worker_done_callback)
         print("🚀 Service started")
     
     # ========== STOP METHOD ==========
@@ -883,6 +942,13 @@ class AsyncLLM:
         
         print("🛑 Service stopped")
     
+    def _validate_queue(self):
+        """Check queue status and warn if near capacity"""
+        if self.queue.qsize() >= self.queue.maxsize:
+            print(f"⚠️ Queue is FULL ({self.queue.qsize()}/{self.queue.maxsize})!")
+            return False
+        return True
+    
     # ========== CHAT METHOD ==========
     async def chat_llm(self, chat: str) -> str:
         """Send a message to the LLM"""
@@ -893,7 +959,8 @@ class AsyncLLM:
             
             if not self._running:
                 raise RuntimeError("Service not started. Call start() first.")
-            
+            if self.queue.qsize() >= self.queue.maxsize * 0.8:
+                print(f"⚠️ Queue is {self.queue.qsize()}/{self.queue.maxsize} - consider reducing load")
             task_id = str(uuid4())[:12]
             future = asyncio.Future()
             
@@ -907,7 +974,7 @@ class AsyncLLM:
             
             print(f"📝 [{task_id}] Queued (position: {self.queue.qsize()})")
             
-            return await asyncio.wait_for(future, timeout=60.0)
+            return await asyncio.wait_for(future, timeout=160.0)
 
             
         except Exception as e:

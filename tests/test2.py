@@ -1,3 +1,9 @@
+import os
+import sys
+# Add parent directory to path so Python can find main.py
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+
 from main import PromptTemplate, AsyncLLM, StrOutputParser
 import asyncio
 from uuid import uuid4
