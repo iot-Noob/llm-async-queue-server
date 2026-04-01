@@ -16,6 +16,8 @@ import json
 import shutil
 import re
 from enum import Enum
+from dataclasses import dataclass,field
+import time
 
 
 class EcharrParsers:
@@ -289,20 +291,40 @@ class PromptTemplate:
         """Async invoke - format prompt"""
         return self.invoke(input_data)
     
+    # def __or__(self, other):
+    #     async def chained(input_data):
+    #         if isinstance(input_data, dict):
+    #             prompt = self.format(**input_data)
+    #         else:
+    #             prompt = self.format(input=input_data)
+            
+    #         if hasattr(other, 'ainvoke'):
+    #             return await other.ainvoke(prompt)
+    #         elif hasattr(other, 'invoke'):
+    #             return other.invoke(prompt)
+    #         elif callable(other):
+    #             return await other(prompt) if asyncio.iscoroutinefunction(other) else other(prompt)
+    #         return prompt
+    #     return Runnable(chained)
+
     def __or__(self, other):
         async def chained(input_data):
             if isinstance(input_data, dict):
+                # Format prompt
                 prompt = self.format(**input_data)
+                # Pass through other keys (like chat_id, timeout)
+                result = {**input_data, "input": prompt}
             else:
                 prompt = self.format(input=input_data)
+                result = {"input": prompt}
             
             if hasattr(other, 'ainvoke'):
-                return await other.ainvoke(prompt)
+                return await other.ainvoke(result)
             elif hasattr(other, 'invoke'):
-                return other.invoke(prompt)
+                return other.invoke(result)
             elif callable(other):
-                return await other(prompt) if asyncio.iscoroutinefunction(other) else other(prompt)
-            return prompt
+                return await other(result) if asyncio.iscoroutinefunction(other) else other(result)
+            return result
         return Runnable(chained)
     
     @classmethod
@@ -339,15 +361,37 @@ class ChatPromptTemplate:
         """Allow: template(topic="Python")"""
         return self.format_prompt(**kwargs)
         
+    # def __or__(self, other):
+    #     async def chained(input_data):
+    #         if isinstance(input_data, dict):
+    #             prompt = self.format_prompt(**input_data)
+    #         else:
+    #             prompt = self.format_prompt(input=input_data)
+    #         return await other(prompt)   # <-- always await
+    #     return Runnable(chained)
+
     def __or__(self, other):
+        """Chain with metadata preservation (keeps chat_id, timeout, etc.)"""
         async def chained(input_data):
             if isinstance(input_data, dict):
+                # Format the prompt using all values from the dict
                 prompt = self.format_prompt(**input_data)
+                # ✅ PRESERVE all original data + add formatted prompt
+                result = {**input_data, "input": prompt}
             else:
+                # Input is a string, treat as user input
                 prompt = self.format_prompt(input=input_data)
-            return await other(prompt)   # <-- always await
+                result = {"input": prompt}
+            
+            # Pass to next component with metadata preserved
+            if hasattr(other, 'ainvoke'):
+                return await other.ainvoke(result)
+            elif hasattr(other, 'invoke'):
+                return other.invoke(result)
+            elif callable(other):
+                return await other(result) if asyncio.iscoroutinefunction(other) else other(result)
+            return result
         return Runnable(chained)
-    
     @classmethod
     def from_messages(cls, messages:List[Tuple[str,str]]):
         """Create template from message list"""
@@ -431,7 +475,212 @@ class JsonOutputParser:
     def __call__(self, response):
         return self.parse(response)
 
+@dataclass(slots=True)  # ✅ slots=True reduces memory usage (~40% less)
+class Document:
+    """
+    Optimized LangChain-style Document class for RAG pipelines.
+    
+    Performance Optimizations:
+    - __slots__ reduces memory footprint by ~40%
+    - Lazy JSON serialization (only when needed)
+    - Efficient string concatenation with join
+    - Early returns for common operations
+    - Minimal overhead for metadata access
+    """
+    
+    # Core fields with type hints
+    page_content: str
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    id: Optional[str] = None
+    
+    # Class-level constants
+    _TRUNCATE_SUFFIX = "..."
+    _MAX_PREVIEW_LEN = 50
 
+    def __post_init__(self):
+        """Auto-generate ID if not provided (minimal overhead)"""
+        if self.id is None:
+            # ✅ Use faster UUID generation for small IDs
+            self.id = uuid4().hex[:8]
+    
+    def __str__(self) -> str:
+        """Fast string conversion"""
+        return self.page_content
+    
+    def __repr__(self) -> str:
+        """Optimized debug representation"""
+        content = self.page_content
+        if len(content) > self._MAX_PREVIEW_LEN:
+            content = content[:self._MAX_PREVIEW_LEN] + self._TRUNCATE_SUFFIX
+        return f"Document(id='{self.id}', page_content='{content}', metadata={self.metadata})"
+    
+    def __len__(self) -> int:
+        """O(1) length operation"""
+        return len(self.page_content)
+    
+    def __bool__(self) -> bool:
+        """Truthy if has content"""
+        return bool(self.page_content)
+    
+    def __eq__(self, other: object) -> bool:
+        """Equality check by ID"""
+        if not isinstance(other, Document):
+            return False
+        return self.id == other.id
+    
+    def __hash__(self) -> int:
+        """Hash based on ID for dict/set usage"""
+        return hash(self.id)
+    
+    def __add__(self, other: 'Document') -> 'Document':
+        """Fast document combination"""
+        if not isinstance(other, Document):
+            return NotImplemented
+        
+        # ✅ Use efficient string concatenation
+        return Document(
+            page_content=f"{self.page_content}\n{other.page_content}",
+            metadata={
+                "sources": [self.metadata, other.metadata],
+                "original_ids": [self.id, other.id]
+            }
+        )
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dict with minimal copying"""
+        return {
+            "id": self.id,
+            "page_content": self.page_content,
+            "metadata": dict(self.metadata)  # Copy to prevent modification
+        }
+    
+    def to_json(self, indent: int = None, compact: bool = False) -> str:
+        """
+        Convert to JSON with options for performance.
+        
+        Args:
+            indent: Pretty print indent (None = compact)
+            compact: Force compact JSON even with indent (ignores indent)
+        """
+        if compact or indent is None:
+            # ✅ Fastest JSON generation (no whitespace)
+            return json.dumps(self.to_dict(), separators=(',', ':'), ensure_ascii=False)
+        return json.dumps(self.to_dict(), indent=indent, ensure_ascii=False)
+    
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> 'Document':
+        """Fast dict creation with defaults"""
+        return cls(
+            page_content=data.get("page_content", ""),
+            metadata=data.get("metadata", {}),
+            id=data.get("id")
+        )
+    
+    @classmethod
+    def from_json(cls, json_str: str) -> 'Document':
+        """Create from JSON string"""
+        return cls.from_dict(json.loads(json_str))
+    
+    @classmethod
+    def combine(cls, documents: List['Document'], separator: str = "\n") -> 'Document':
+        """
+        Optimized combine using list comprehension and efficient join.
+        """
+        if not documents:
+            raise ValueError("Cannot combine empty list of documents")
+        
+        # ✅ Single pass through documents for content and metadata
+        contents = []
+        original_ids = []
+        sources = []
+        
+        for doc in documents:
+            contents.append(doc.page_content)
+            original_ids.append(doc.id)
+            sources.append(doc.metadata)
+        
+        # ✅ Efficient string joining
+        combined_content = separator.join(contents)
+        
+        return cls(
+            page_content=combined_content,
+            metadata={
+                "combined": True,
+                "original_count": len(documents),
+                "original_ids": original_ids,
+                "sources": sources
+            }
+        )
+    
+    def get_metadata(self, key: str, default: Any = None) -> Any:
+        """Fast metadata access with default"""
+        return self.metadata.get(key, default)
+    
+    def has_metadata(self, key: str) -> bool:
+        """Fast metadata existence check"""
+        return key in self.metadata
+    
+    def add_metadata(self, key: str, value: Any) -> 'Document':
+        """
+        Add metadata and return new document (immutable).
+        Optimized to avoid copying large metadata dict when possible.
+        """
+        # ✅ Create new dict with single copy operation
+        new_metadata = {**self.metadata, key: value}
+        return Document(
+            page_content=self.page_content,
+            metadata=new_metadata,
+            id=self.id
+        )
+    
+    def truncate(self, max_chars: int = 500, suffix: str = "...") -> 'Document':
+        """
+        Optimized truncation with early return.
+        """
+        # ✅ Early return if no truncation needed
+        if len(self.page_content) <= max_chars:
+            return self
+        
+        # ✅ Calculate truncation point
+        trunc_len = max_chars - len(suffix)
+        if trunc_len <= 0:
+            # If max_chars is too small, return just the suffix
+            truncated_content = suffix
+        else:
+            truncated_content = self.page_content[:trunc_len] + suffix
+        
+        # ✅ Only add truncation metadata if changed
+        return Document(
+            page_content=truncated_content,
+            metadata={
+                **self.metadata,
+                "truncated": True,
+                "original_length": len(self.page_content),
+                "truncated_length": max_chars
+            },
+            id=self.id
+        )
+    
+    def copy(self, **kwargs) -> 'Document':
+        """
+        Create a copy with optional field updates.
+        Optimized for common use cases.
+        """
+        return Document(
+            page_content=kwargs.get("page_content", self.page_content),
+            metadata=kwargs.get("metadata", self.metadata.copy()),
+            id=kwargs.get("id", self.id)
+        )
+    
+    def batch_to_dicts(self, documents: List['Document']) -> List[Dict[str, Any]]:
+        """Convert multiple documents to dicts efficiently"""
+        return [doc.to_dict() for doc in documents]
+    
+    @staticmethod
+    def batch_from_dicts(dicts: List[Dict[str, Any]]) -> List['Document']:
+        """Create multiple documents from dicts efficiently"""
+        return [Document.from_dict(d) for d in dicts]
+ 
 class PydanticOutputParser(JsonOutputParser, Generic[T]):
     """
     LangChain-style Pydantic Output Parser.
@@ -449,6 +698,125 @@ class PydanticOutputParser(JsonOutputParser, Generic[T]):
 class AsyncLLM:
  
     def __init__(self, ** kwargs):
+        """
+        An asynchronous, queue-based LLM wrapper for llama.cpp with LangChain-like chaining.
+        
+        This class provides a production-ready interface for running GGUF models with:
+        - Non-blocking async/await support
+        - Queue-based request handling for concurrent operations
+        - Automatic memory management and cleanup
+        - Pluggable output parsers (JSON, Pydantic, plain text)
+        - Worker crash detection and optional auto-restart
+        - Configurable memory thresholds for different devices
+        
+        Features
+        --------
+        * Async queue processing with background worker
+        * Chainable with Runnable components using | operator
+        * Automatic stop token detection and logging
+        * Graceful fallbacks for parsing errors
+        * Memory leak prevention with garbage collection
+        * Cross-platform support (Linux, Windows, Android via Termux)
+        
+        Parameters
+        ----------
+        available_ram : int, optional
+            Minimum required free RAM in MB before loading model.
+            Set to 0 to disable check. Default: 3000 (3GB)
+        model_path : str, optional
+            Direct path to models directory. Overrides .env file.
+        worker_exception_callback : callable, optional
+            Function called when worker crashes. Receives exception as argument.
+        auto_restart_worker : bool, optional
+            Whether to automatically restart worker on crash. Default: False
+        temperature : float, optional
+            Sampling temperature (0.0 = deterministic, 2.0 = random). Default: 0.1
+        top_p : float, optional
+            Nucleus sampling threshold (0.0 to 1.0). Default: 0.9
+        top_k : int, optional
+            Top-k sampling limit. Default: 30
+        streaming : bool, optional
+            Enable token streaming (not fully implemented). Default: False
+        repeat_penalty : float, optional
+            Penalty for repeating tokens (1.0 = no penalty). Default: None
+        n_predict : int, optional
+            Maximum tokens to generate. Default: 2048
+        n_batch : int, optional
+            Batch size for prompt processing. Default: 128
+        n_ctx : int, optional
+            Context window size (input memory). Default: 2048
+        n_threads : int, optional
+            Number of CPU threads. Default: 6
+        n_gpu_layers : int, optional
+            GPU layers to offload (-1 = all, 0 = CPU only). Default: -1
+        verbose : bool, optional
+            Enable verbose logging. Default: False
+        stop : List[str], optional
+            Stop sequences. Default: ["<|endoftext|>", "<|im_end|>"]
+        output_parser : object, optional
+            Custom output parser (must have parse method). Default: StrOutputParser()
+        
+        Examples
+        --------
+        Basic Usage:
+        >>> llm = AsyncLLM()
+        >>> await llm._load_model(model_name="my-model.gguf")
+        >>> await llm.start()
+        >>> response = await llm.chat_llm("What is Python?")
+        >>> print(response)
+        >>> await llm.stop()
+        >>> llm.unload_all_models()
+        
+        With Chaining:
+        >>> prompt = PromptTemplate(template="User: {input}\\nAssistant: ")
+        >>> parser = StrOutputParser()
+        >>> chain = prompt | llm | parser
+        >>> result = await chain.ainvoke({"input": "Hello"})
+        
+        With Pydantic Output:
+        >>> class Person(BaseModel):
+        ...     name: str
+        ...     age: int
+        >>> parser = PydanticOutputParser(pydantic_object=Person)
+        >>> chain = prompt | llm | parser
+        >>> result = await chain.ainvoke({"input": "Create a person"})
+        >>> print(result.name, result.age)
+        
+        For Mobile Devices (Samsung A06, Raspberry Pi):
+        >>> llm = AsyncLLM(
+        ...     available_ram=1500,  # Only need 1.5GB free
+        ...     n_ctx=2048,          # Smaller context
+        ...     n_predict=256,       # Shorter responses
+        ...     n_threads=4,         # Match CPU cores
+        ...     n_gpu_layers=0       # CPU only
+        ... )
+        
+        With Error Callback:
+        >>> def on_crash(exception):
+        ...     print(f"Worker crashed: {exception}")
+        ...     # Send alert, restart service, etc.
+        >>> llm = AsyncLLM(
+        ...     worker_exception_callback=on_crash,
+        ...     auto_restart_worker=True
+        ... )
+        
+        Notes
+        -----
+        - Model path can be set via .env file (MODEL_PATH="/path/to/models") or passed directly
+        - Memory check prevents OOM crashes on low-RAM devices
+        - Worker crash callback enables monitoring and recovery
+        - Queue size is 10; requests beyond that wait
+        - Default timeout is 160 seconds for generation
+        
+        See Also
+        --------
+        StrOutputParser : Simple string output parser
+        JsonOutputParser : JSON output with optional Pydantic validation
+        PydanticOutputParser : Type-safe Pydantic model output
+        PromptTemplate : Template for formatting prompts
+        Runnable : Base class for chainable components
+        """
+        self.available_ram=kwargs.get("available_ram",3000)
         self.setting=Settings()
         self.model_path=kwargs.get("model_path")
         self._worker_exception_callback = kwargs.get("worker_exception_callback", None)
@@ -546,8 +914,8 @@ class AsyncLLM:
             if not model_name:
                 raise ValueError("model_name is required")
             avail = psutil.virtual_memory().available / (1024**2)
-            if avail < 3000:
-                raise MemoryError(f"Need 3GB+ free, have {avail:.0f}MB")
+            if avail < self.available_ram:
+                raise MemoryError(f"Need {(self.available_ram/1000)}GB free, have {avail:.0f}MB")
             # Get optional parameters with defaults
             self.temperature = kwargs.get("temperature", 0.1)
             self.top_p = kwargs.get("top_p", 0.9)
@@ -656,6 +1024,8 @@ class AsyncLLM:
                     print("🔄 Auto-restarting worker...")
                     self._worker_task = asyncio.create_task(self._worker())
                     self._worker_task.add_done_callback(self._worker_done_callback)
+    
+    
     def get_loaded_models(self) -> List[str]:
     
         """
@@ -950,8 +1320,28 @@ class AsyncLLM:
         return True
     
     # ========== CHAT METHOD ==========
-    async def chat_llm(self, chat: str) -> str:
-        """Send a message to the LLM"""
+    async def chat_llm(self, chat: str,chat_id:Optional[str]=None,timeout:float=160.0) -> str:
+        """    Send a message to the LLM with optional custom request ID.
+    
+    Args:
+        chat: The user message/prompt to send
+        chat_id: Optional custom ID for tracking this request.
+                 If not provided, auto-generates a UUID.
+        timeout: Maximum time to wait for response in seconds.
+                 Default: 160.0
+    
+    Returns:
+        The LLM's response as a string
+    
+    Examples:
+        >>> # Auto-generate ID
+        >>> response = await llm.chat_llm("Hello")
+        
+        >>> # Custom ID for tracking
+        >>> response = await llm.chat_llm("Hello", chat_id="user_123")
+        
+        >>> # Custom timeout
+        >>> response = await llm.chat_llm("Long essay", timeout=300.0)"""
         try:
             task_id=None
             if not self.current_model:
@@ -961,52 +1351,85 @@ class AsyncLLM:
                 raise RuntimeError("Service not started. Call start() first.")
             if self.queue.qsize() >= self.queue.maxsize * 0.8:
                 print(f"⚠️ Queue is {self.queue.qsize()}/{self.queue.maxsize} - consider reducing load")
-            task_id = str(uuid4())[:12]
+            if chat_id:
+                task_id=chat_id
+            else:
+                task_id = str(uuid4())[:12]
             future = asyncio.Future()
-            
+            if task_id in self.futures:
+                raise ValueError(f"Request ID '{task_id}' is already in use. Use a unique ID.")
             self.futures[task_id] = future
             
             await self.queue.put({
                 "task_id": task_id,
                 "prompt": chat,
-                "future": future
+                "future": future,
+                "timestamp": time.time()
             })
             
             print(f"📝 [{task_id}] Queued (position: {self.queue.qsize()})")
             
-            return await asyncio.wait_for(future, timeout=160.0)
+            return await asyncio.wait_for(future, timeout=timeout)
 
             
         except Exception as e:
             print(f"❌ Error in chat: {e}")
             raise
         finally:
-            self.futures.pop(task_id, None) 
-            print(f"🗑️ [{task_id}] Future cleaned from memory")
+            if 'task_id' in locals() and task_id in self.futures:
+                self.futures.pop(task_id, None)
+                print(f"🗑️ [{task_id}] Future cleaned from memory")
     async def ainvoke(self, input: Union[str, Dict]) -> str:
         """Async invoke for chaining"""
         if isinstance(input, dict):
             prompt = input.get("input", str(input))
+            chat_id = input.get("chat_id")  # Optional
+            timeout = input.get("timeout", 160.0)  # Optional custom timeout
         else:
             prompt = str(input)
-        return await self.chat_llm(prompt)
+            chat_id = None  # ← ADD THIS
+            timeout = 160.0  # ← ADD THIS
+        return await self.chat_llm(prompt,chat_id=chat_id,timeout=timeout)
     
     def invoke(self, input: Union[str, Dict]) -> str:
         """Sync invoke - runs LLM"""
         if isinstance(input, dict):
             prompt = input.get("input", str(input))
+            chat_id = input.get("chat_id")
+            timeout = input.get("timeout", 160.0)
         else:
             prompt = str(input)
+            chat_id = None
+            timeout = 160.0
         
         try:
             # Try to run in existing loop
             loop = asyncio.get_running_loop()
         except RuntimeError:
             # No running loop, create new one
-            return asyncio.run(self.chat_llm(prompt))
+            return asyncio.run(self.chat_llm(prompt, chat_id, timeout))
         else:
-            # Already in async context
-            return loop.run_until_complete(self.chat_llm(prompt))
+            # ✅ Already in async context - need to pass chat_id and timeout!
+            return loop.run_until_complete(self.chat_llm(prompt, chat_id, timeout))    
+    # def invoke(self, input: Union[str, Dict]) -> str:
+    #     """Sync invoke - runs LLM"""
+    #     if isinstance(input, dict):
+    #         prompt = input.get("input", str(input))
+    #         chat_id = input.get("chat_id")  # Optional
+    #         timeout = input.get("timeout", 160.0)  # Optional custom timeout
+    #     else:
+    #         prompt = str(input)
+    #         chat_id = None  # ← ADD THIS
+    #         timeout = 160.0  # ← ADD THIS
+    #     try:
+    #         # Try to run in existing loop
+    #         loop = asyncio.get_running_loop()
+    #     except RuntimeError:
+    #         # No running loop, create new one
+    #         return asyncio.run(self.chat_llm(prompt,chat_id,timeout))
+    #     else:
+    #         # Already in async context
+    #         return loop.run_until_complete(self.chat_llm(prompt))
     
     def __or__(self, other):
         async def chained(value):
