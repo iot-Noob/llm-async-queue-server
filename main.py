@@ -1240,7 +1240,7 @@ class AsyncLLM:
                     top_p=self.top_p,
                     top_k=self.top_k,
                     # Remove stream if you don't handle it
-                    # stream=self.streaming,  
+                    stream=self.streaming,  
                 )
                 if isinstance(raw_response, dict) and "choices" in raw_response:
                     choice = raw_response["choices"][0]

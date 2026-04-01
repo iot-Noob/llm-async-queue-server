@@ -20,6 +20,7 @@ async def main():
             temperature=0.6,
             n_predict=512,
             n_ctx=4096,
+            streaming=False,
             stop=["<|im_end|>"]
         )
         await llm.start()
