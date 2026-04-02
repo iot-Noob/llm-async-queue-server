@@ -9,7 +9,7 @@ from langchain.embeddings import Embeddings
 from langchain_community.retrievers import WikipediaRetriever
 from uuid import uuid4
 import asyncio
-from typing import Dict,List,Union,Any,Tuple,Type,TypeVar,Optional,Generic
+from typing import Dict, List, Union, Any, Optional, Tuple, Type, TypeVar, Generic
 from queue import Queue
 import psutil
 import json
@@ -18,7 +18,9 @@ import re
 from enum import Enum
 from dataclasses import dataclass,field
 import time
+import logging
 
+logger = logging.getLogger(__name__)
 
 class EcharrParsers:
     def __init__(self):
@@ -695,155 +697,68 @@ class PydanticOutputParser(JsonOutputParser, Generic[T]):
         """Parse and return validated Pydantic model"""
         return super().parse(response)
 
+
+
 class AsyncLLM:
- 
-    def __init__(self, ** kwargs):
-        """
-        An asynchronous, queue-based LLM wrapper for llama.cpp with LangChain-like chaining.
-        
-        This class provides a production-ready interface for running GGUF models with:
-        - Non-blocking async/await support
-        - Queue-based request handling for concurrent operations
-        - Automatic memory management and cleanup
-        - Pluggable output parsers (JSON, Pydantic, plain text)
-        - Worker crash detection and optional auto-restart
-        - Configurable memory thresholds for different devices
-        
-        Features
-        --------
-        * Async queue processing with background worker
-        * Chainable with Runnable components using | operator
-        * Automatic stop token detection and logging
-        * Graceful fallbacks for parsing errors
-        * Memory leak prevention with garbage collection
-        * Cross-platform support (Linux, Windows, Android via Termux)
-        
-        Parameters
-        ----------
-        available_ram : int, optional
-            Minimum required free RAM in MB before loading model.
-            Set to 0 to disable check. Default: 3000 (3GB)
-        model_path : str, optional
-            Direct path to models directory. Overrides .env file.
-        worker_exception_callback : callable, optional
-            Function called when worker crashes. Receives exception as argument.
-        auto_restart_worker : bool, optional
-            Whether to automatically restart worker on crash. Default: False
-        temperature : float, optional
-            Sampling temperature (0.0 = deterministic, 2.0 = random). Default: 0.1
-        top_p : float, optional
-            Nucleus sampling threshold (0.0 to 1.0). Default: 0.9
-        top_k : int, optional
-            Top-k sampling limit. Default: 30
-        streaming : bool, optional
-            Enable token streaming (not fully implemented). Default: False
-        repeat_penalty : float, optional
-            Penalty for repeating tokens (1.0 = no penalty). Default: None
-        n_predict : int, optional
-            Maximum tokens to generate. Default: 2048
-        n_batch : int, optional
-            Batch size for prompt processing. Default: 128
-        n_ctx : int, optional
-            Context window size (input memory). Default: 2048
-        n_threads : int, optional
-            Number of CPU threads. Default: 6
-        n_gpu_layers : int, optional
-            GPU layers to offload (-1 = all, 0 = CPU only). Default: -1
-        verbose : bool, optional
-            Enable verbose logging. Default: False
-        stop : List[str], optional
-            Stop sequences. Default: ["<|endoftext|>", "<|im_end|>"]
-        output_parser : object, optional
-            Custom output parser (must have parse method). Default: StrOutputParser()
-        
-        Examples
-        --------
-        Basic Usage:
-        >>> llm = AsyncLLM()
-        >>> await llm._load_model(model_name="my-model.gguf")
-        >>> await llm.start()
-        >>> response = await llm.chat_llm("What is Python?")
-        >>> print(response)
-        >>> await llm.stop()
-        >>> llm.unload_all_models()
-        
-        With Chaining:
-        >>> prompt = PromptTemplate(template="User: {input}\\nAssistant: ")
-        >>> parser = StrOutputParser()
-        >>> chain = prompt | llm | parser
-        >>> result = await chain.ainvoke({"input": "Hello"})
-        
-        With Pydantic Output:
-        >>> class Person(BaseModel):
-        ...     name: str
-        ...     age: int
-        >>> parser = PydanticOutputParser(pydantic_object=Person)
-        >>> chain = prompt | llm | parser
-        >>> result = await chain.ainvoke({"input": "Create a person"})
-        >>> print(result.name, result.age)
-        
-        For Mobile Devices (Samsung A06, Raspberry Pi):
-        >>> llm = AsyncLLM(
-        ...     available_ram=1500,  # Only need 1.5GB free
-        ...     n_ctx=2048,          # Smaller context
-        ...     n_predict=256,       # Shorter responses
-        ...     n_threads=4,         # Match CPU cores
-        ...     n_gpu_layers=0       # CPU only
-        ... )
-        
-        With Error Callback:
-        >>> def on_crash(exception):
-        ...     print(f"Worker crashed: {exception}")
-        ...     # Send alert, restart service, etc.
-        >>> llm = AsyncLLM(
-        ...     worker_exception_callback=on_crash,
-        ...     auto_restart_worker=True
-        ... )
-        
-        Notes
-        -----
-        - Model path can be set via .env file (MODEL_PATH="/path/to/models") or passed directly
-        - Memory check prevents OOM crashes on low-RAM devices
-        - Worker crash callback enables monitoring and recovery
-        - Queue size is 10; requests beyond that wait
-        - Default timeout is 160 seconds for generation
-        
-        See Also
-        --------
-        StrOutputParser : Simple string output parser
-        JsonOutputParser : JSON output with optional Pydantic validation
-        PydanticOutputParser : Type-safe Pydantic model output
-        PromptTemplate : Template for formatting prompts
-        Runnable : Base class for chainable components
-        """
-        self.available_ram=kwargs.get("available_ram",3000)
-        self._active_streams: set = set()   # <-- ADD THIS LINE
-        self.setting=Settings()
-        self.model_path=kwargs.get("model_path")
+    class Config:
+        """Central configuration for AsyncLLM."""
+        def __init__(self, **kwargs):
+            self.available_ram = kwargs.get("available_ram", 3000)          # MB
+            self.queue_maxsize = kwargs.get("queue_maxsize", 10)
+            self.default_timeout = kwargs.get("default_timeout", 160.0)   # seconds
+            self.graceful_shutdown = kwargs.get("graceful_shutdown", True) # wait for in‑flight requests
+            self.enable_metrics = kwargs.get("enable_metrics", True)
+            self.enable_cancellation = kwargs.get("enable_cancellation", True)
+            self.reject_on_full_queue = kwargs.get("reject_on_full_queue", True)
+
+    def __init__(self, **kwargs):
+        # Load configuration
+        self.config = self.Config(**kwargs)
+
+        # Setup logging (you may want to configure level/handlers externally)
+        if not logger.handlers:
+            handler = logging.StreamHandler()
+            handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+            logger.addHandler(handler)
+            logger.setLevel(logging.INFO)
+
+        self.setting = Settings()
+        self.model_path = kwargs.get("model_path")
         self._worker_exception_callback = kwargs.get("worker_exception_callback", None)
         self._auto_restart_worker = kwargs.get("auto_restart_worker", False)
-        self.futures:Dict[str,asyncio.Future]={}    
-        self.current_model:Dict[str,llama_cpp.Llama]={}
+
+        self.futures: Dict[str, asyncio.Future] = {}
+        self._active_streams: set = set()
+        self.current_model: Dict[str, llama_cpp.Llama] = {}
+
+        # Metrics
+        self._metrics = {
+            "total_requests": 0,
+            "total_errors": 0,
+            "streaming_requests": 0,
+            "completed_requests": 0,
+        }
+
         if self.model_path:
-            self.path=self.model_path
+            self.path = self.model_path
         else:
             try:
-                self.path=self.setting.MODEL_PATH
-            except ValidationError as ve:
-                raise ValueError(f"MODEL_PATH not set. Provide it via .env or pass model_path argument.") from ve
-        
- 
-        self.async_lock=asyncio.Lock()
-        self.queue=asyncio.Queue(maxsize=10)
-        self._running=False
-        self._worker_task=None
+                self.path = self.setting.MODEL_PATH
+            except ValidationError:
+                raise ValueError("MODEL_PATH not set. Provide it via .env or pass model_path argument.")
 
+        self.queue = asyncio.Queue(maxsize=self.config.queue_maxsize)
+        self._running = False
+        self._worker_task = None
+        self._shutdown_event = asyncio.Event()
+
+        # Default generation parameters (can be overridden per request)
         self.temperature = kwargs.get("temperature", 0.1)
         self.top_p = kwargs.get("top_p", 0.9)
         self.top_k = kwargs.get("top_k", 30)
         self.streaming = kwargs.get("streaming", False)
-        self.repeat_penalty = kwargs.get("repeat_penalty",None)
-        self.n_predict = kwargs.get("n_predict", kwargs.get("n_predict", 2048))
+        self.repeat_penalty = kwargs.get("repeat_penalty", None)
+        self.n_predict = kwargs.get("n_predict", 2048)
         self.n_batch = kwargs.get("n_batch", 128)
         self.n_ctx = kwargs.get("n_ctx", 2048)
         self.n_threads = kwargs.get("n_threads", 6)
@@ -851,118 +766,86 @@ class AsyncLLM:
         self.verbose = kwargs.get("verbose", False)
         self.stops = kwargs.get("stop", ["<|endoftext|>", "<|im_end|>"])
         self.output_parser = kwargs.get("output_parser", StrOutputParser())
- 
 
+    # ------------------------ Health & Metrics ------------------------
+    def is_healthy(self) -> bool:
+        """Health check: service running and at least one model loaded."""
+        return self._running and len(self.current_model) > 0
+
+    def get_metrics(self) -> Dict[str, Any]:
+        """Return current metrics."""
+        metrics = self._metrics.copy()
+        metrics["queue_size"] = self.queue.qsize()
+        metrics["active_streams"] = len(self._active_streams)
+        metrics["models_loaded"] = len(self.current_model)
+        return metrics
+
+    # ------------------------ Request Cancellation ------------------------
+    async def cancel_request(self, request_id: str):
+        """Cancel a pending or in‑progress request (non‑streaming) or stop a stream."""
+        if request_id in self.futures and not self.futures[request_id].done():
+            self.futures[request_id].set_exception(asyncio.CancelledError(f"Request {request_id} cancelled"))
+            logger.info(f"Cancelled request {request_id}")
+        elif request_id in self._active_streams:
+            # For streaming, we need to force the worker to stop. Simpler: remove the future and close stream.
+            # We'll rely on the monitor task to abort.
+            # Actually, we can add a cancellation queue. For brevity, we raise.
+            raise NotImplementedError("Stream cancellation not implemented yet – use the monitor's future exception")
+        else:
+            logger.warning(f"Request {request_id} not found or already completed")
+
+    # ------------------------ Model Management ------------------------
     async def _get_model_in_current_dirs(self):
-        """Get all .gguf models in directory"""
         try:
-            
-            # Run blocking os.walk in thread to avoid blocking event loop
-            all_files = await asyncio.to_thread(self._walk_directory)
-            return all_files
+            return await asyncio.to_thread(self._walk_directory)
         except Exception as e:
             raise ValueError(f"Error getting models: {e}")
-    
+
     def _walk_directory(self):
-        """Blocking directory walk - runs in thread"""
         all_files = []
         for root, _, files in os.walk(self.path):
             for f in files:
                 if f.endswith(".gguf"):
                     bp = os.path.join(root, f)
-                    all_files.append({
-                        "path": bp,
-                        "filename": f,
-                        "directory": root
-                    })
+                    all_files.append({"path": bp, "filename": f, "directory": root})
         return all_files
- 
+
     async def _load_model(self, **kwargs: dict):
-        """
-        # GGUF Model loader
-
-        ### kwargs contain param:
-
-        **model_name:** name of gguf model just name of it it will automatically search within dir
-
-        **temperature:** llm temperature for random answers (0.0 = deterministic, 2.0 = very random)
-
-        **top_p:** nucleus sampling threshold - only sample from tokens with cumulative probability >= top_p (0.0 to 1.0)
-
-        **top_k:** top-k sampling - only sample from the top K tokens (1 to 100)
-
-        **streaming:** if True, stream tokens as they're generated token by token
-
-        **repeat_penalty:** penalty for repeating tokens (1.0 = no penalty, >1.0 = penalize repeats)
-
-        **max_tokens:** maximum number of tokens to generate (1 to 4096)
-
-        **n_batch:** batch size for prompt processing (higher = faster but more memory)
-
-        **n_ctx:** context window size - maximum tokens model can remember (512 to 32768)
-
-        **n_threads:** number of CPU threads for inference
-
-        **n_gpu_layers:** number of layers to offload to GPU (-1 = all layers, 0 = CPU only)
-
-        **verbose:** if True, print detailed debug logs during inference
-
-        **stop:** list of stop sequences where generation should end (e.g., ["<|endoftext|>", "<|im_end|>"])
-        """
         try:
-            # Get required parameters
             model_name = kwargs.get("model_name")
             if not model_name:
                 raise ValueError("model_name is required")
             avail = psutil.virtual_memory().available / (1024**2)
-            if avail < self.available_ram:
-                raise MemoryError(f"Need {(self.available_ram/1000)}GB free, have {avail:.0f}MB")
-            # Get optional parameters with defaults
+            if avail < self.config.available_ram:
+                raise MemoryError(f"Need {self.config.available_ram/1000}GB free, have {avail:.0f}MB")
+
+            # Override default params for this model
             self.temperature = kwargs.get("temperature", 0.1)
             self.top_p = kwargs.get("top_p", 0.9)
             self.top_k = kwargs.get("top_k", 30)
             self.streaming = kwargs.get("streaming", False)
-            self.repeat_penalty = kwargs.get("repeat_penalty",None)
-            self.n_predict = kwargs.get("n_predict", kwargs.get("n_predict", 2048))
+            self.repeat_penalty = kwargs.get("repeat_penalty", None)
+            self.n_predict = kwargs.get("n_predict", 2048)
             self.n_batch = kwargs.get("n_batch", 128)
             self.n_ctx = kwargs.get("n_ctx", 2048)
             self.n_threads = kwargs.get("n_threads", 6)
             self.n_gpu_layers = kwargs.get("n_gpu_layers", -1)
             self.verbose = kwargs.get("verbose", False)
             self.stops = kwargs.get("stop", ["<|endoftext|>", "<|im_end|>"])
-           
-            # Validate model_name
-            if not model_name or not isinstance(model_name, str):
-                raise ValueError(f"Invalid model_name: {model_name}")
-            
-            # Check if model already loaded
+
             if model_name in self.current_model:
-                raise ValueError(f"Model '{model_name}' is already loaded")
-            
-            # Build model path
+                raise ValueError(f"Model '{model_name}' already loaded")
+
             fmp = os.path.join(self.path, model_name)
-            
-            # Check if file exists directly
             if not os.path.exists(fmp):
-                # Try to search in subdirectories
-                found_path = None
                 models = await self._get_model_in_current_dirs()
-                for model in models:
-                    if model["filename"] == model_name:
-                        found_path = model["path"]
-                        break
-                
-                if found_path:
-                    fmp = found_path
+                found = next((m for m in models if m["filename"] == model_name), None)
+                if found:
+                    fmp = found["path"]
                 else:
-                    raise FileNotFoundError(f"Model file '{model_name}' not found in '{self.path}'")
-            
-            print(f"📦 Loading model: {fmp}")
-            print(f"   Temperature: {self.temperature}")
-            print(f"   Max tokens: {self.n_predict}")
-            print(f"   GPU layers: {self.n_gpu_layers}")
-       
-            # Load model in thread to avoid blocking
+                    raise FileNotFoundError(f"Model '{model_name}' not found in '{self.path}'")
+
+            logger.info(f"Loading model: {fmp} (temp={self.temperature}, max_tokens={self.n_predict}, gpu_layers={self.n_gpu_layers})")
             llm = await asyncio.to_thread(
                 llama_cpp.Llama,
                 model_path=fmp,
@@ -979,207 +862,265 @@ class AsyncLLM:
                 verbose=self.verbose,
                 stop=self.stops,
             )
-            
-            # Store loaded model
             self.current_model[model_name] = llm
-            
-            print(f"✅ Model '{model_name}' loaded successfully!")
-            
+            logger.info(f"Model '{model_name}' loaded successfully")
             return llm
-            
-        except FileNotFoundError as e:
-            raise ValueError(f"Model not found: {e}")
         except Exception as e:
-            raise ValueError(f"Error loading model: {e}")
+            logger.error(f"Failed to load model: {e}")
+            raise
 
-    # def run_task(self,tname,**kw):
-    #     try:f
-    #         if callable(tname):
-    #             res= self.loop.run_until_complete(tname(**kw))
-    #             return res
-    #     except Exception as e:
-    #         raise ValueError(f"Error run task due to {e}")
-
-
+    # ------------------------ Worker Lifecycle ------------------------
     def _worker_done_callback(self, task):
-            """Handle worker task completion and exceptions"""
-            if task.cancelled():
-                print("⚠️ Worker task was cancelled")
-                return
-            
-            exception = task.exception()
-            if exception:
-                print(f"❌ Worker task crashed with exception: {exception}")
-                import traceback
-                traceback.print_exception(type(exception), exception, exception.__traceback__)
-                
-                # Call custom callback if provided
-                if self._worker_exception_callback:
-                    try:
-                        self._worker_exception_callback(exception)
-                    except Exception as e:
-                        print(f"⚠️ Exception callback failed: {e}")
-                
-                # Optional: Auto-restart worker
-                if hasattr(self, '_auto_restart_worker') and self._auto_restart_worker:
-                    print("🔄 Auto-restarting worker...")
-                    self._worker_task = asyncio.create_task(self._worker())
-                    self._worker_task.add_done_callback(self._worker_done_callback)
-    
-    
-    def get_loaded_models(self) -> List[str]:
-    
-        """
-        Get a list of currently loaded model names.
-        
-        Returns:
-            List[str]: List of loaded model names. Returns empty list if no models loaded.
-        
-        Example:
-            >>> loaded = llm.get_loaded_models()
-            >>> print(loaded)  # ['mistral-7b.gguf', 'llama-2.gguf']
-            >>> if loaded:
-            ...     print(f"Active models: {', '.join(loaded)}")
-        """
-        try:
-            # Convert keys view to list for easier handling
-            return list(self.current_model.keys())
-            
-        except Exception as e:
-            print(f"❌ Error getting loaded models: {e}")
-            return []  # Return empty list on error
+        if task.cancelled():
+            logger.warning("Worker task cancelled")
+            return
+        exception = task.exception()
+        if exception:
+            logger.error(f"Worker crashed: {exception}", exc_info=True)
+            if self._worker_exception_callback:
+                try:
+                    self._worker_exception_callback(exception)
+                except Exception as e:
+                    logger.error(f"Exception callback failed: {e}")
+            if self._auto_restart_worker:
+                logger.info("Auto‑restarting worker...")
+                self._worker_task = asyncio.create_task(self._worker())
+                self._worker_task.add_done_callback(self._worker_done_callback)
 
-    def unload_model(self, model_name: str = None):
-        """
-        Unload a model to free memory and GPU resources.
-        
-        Args:
-            model_name (str, optional): Name of the model to unload.
-                If None, unloads all loaded models.
-        
-        Returns:
-            bool: True if unloaded successfully, False otherwise.
-        
-        Example:
-            >>> llm.unload_model("mistral-7b.gguf")
-            >>> llm.unload_model()  # Unload all
-        """
-        try:
-            # If no model name provided, unload all
-            if model_name is None:
-                if not self.current_model:
-                    print("No models loaded to unload")
-                    return True
-                
-                count = len(self.current_model)
-                print(f"Unloading {count} model(s)...")
-                
-                for name in list(self.current_model.keys()):
-                    self._unload_single_model(name)
-                
-                self.current_model.clear()
-                print(f"✅ Unloaded {count} model(s)")
-                return True
-            
-            # Unload specific model
-            if model_name not in self.current_model:
-                raise ValueError(f"Model '{model_name}' not loaded. Available: {list(self.current_model.keys())}")
-            
-            return self._unload_single_model(model_name)
-            
-        except Exception as e:
-            print(f"❌ Error unloading model: {e}")
-            return False
-
-    def _unload_single_model(self, model_name: str) -> bool:
-        """(
-        Internal method to unload a single model.
-        
-        Args:
-            model_name: Name of the model to unload
-        
-        Returns:
-            bool: True if unloaded successfully
-        """
-        try:
-            print(f"📤 Unloading model: {model_name}")
-            
-            # Get the model instance
-            model = self.current_model.get(model_name)
-            
-            if model:
-                # Close any open resources
-                if hasattr(model, 'close'):
-                    try:
-                        model.close()
-                    except:
-                        pass
-                
-                # Delete the reference
-                del self.current_model[model_name]
-                print(f"   ✅ Model reference deleted")
-            
-      
-            gc.collect()
-            print(f"   🧹 Garbage collection ran")
-            
-            # Try to free memory (Linux only)
+    async def _worker(self):
+        while self._running:
+            task = None
             try:
-                libc = ctypes.CDLL("libc.so.6")
-                libc.malloc_trim(0)
-                print(f"   💾 Memory trimmed")
+                task = await asyncio.wait_for(self.queue.get(), timeout=1.0)
+                task_id = task["task_id"]
+                prompt = task["prompt"]
+                future = task["future"]
+                stream = task.get("stream", False)
+                stream_queue = task.get("stream_queue")
+
+                if not self.current_model:
+                    future.set_exception(ValueError("No model loaded"))
+                    continue
+
+                model = list(self.current_model.values())[0]
+
+                if stream:
+                    loop = asyncio.get_running_loop()
+                    repeat_penalty_val = task.get("repeat_penalty", self.repeat_penalty)
+                    if repeat_penalty_val is None:
+                        repeat_penalty_val = 1.0
+
+                    def generate():
+                        generator = model(
+                            prompt,
+                            max_tokens=task.get("max_tokens", self.n_predict),
+                            temperature=task.get("temperature", self.temperature),
+                            top_p=task.get("top_p", self.top_p),
+                            top_k=task.get("top_k", self.top_k),
+                            stream=True,
+                            stop=task.get("stop", self.stops),
+                            repeat_penalty=repeat_penalty_val,
+                        )
+                        try:
+                            for chunk in generator:
+                                token = chunk["choices"][0]["text"]
+                                asyncio.run_coroutine_threadsafe(stream_queue.put(token), loop)
+                        except Exception as e:
+                            asyncio.run_coroutine_threadsafe(stream_queue.put(e), loop)
+                        finally:
+                            asyncio.run_coroutine_threadsafe(stream_queue.put(None), loop)
+                            if not future.done():
+                                loop.call_soon_threadsafe(future.set_result, None)
+
+                    await asyncio.to_thread(generate)
+                else:
+                    logger.info(f"Processing request {task_id}: {prompt[:50]}...")
+                    repeat_penalty_val = task.get("repeat_penalty", self.repeat_penalty)
+                    if repeat_penalty_val is None:
+                        repeat_penalty_val = 1.0
+
+                    raw_response = await asyncio.to_thread(
+                        model,
+                        prompt,
+                        max_tokens=task.get("max_tokens", self.n_predict),
+                        temperature=task.get("temperature", self.temperature),
+                        top_p=task.get("top_p", self.top_p),
+                        top_k=task.get("top_k", self.top_k),
+                        stream=False,
+                        stop=task.get("stop", self.stops),
+                        repeat_penalty=repeat_penalty_val,
+                    )
+                    if isinstance(raw_response, dict) and "choices" in raw_response:
+                        finish_reason = raw_response["choices"][0].get("finish_reason")
+                        if finish_reason == "length":
+                            logger.warning(f"Request {task_id} stopped due to max_tokens limit")
+                        elif finish_reason == "stop":
+                            logger.info(f"Request {task_id} stopped by stop token")
+
+                    text_output = self._parse_raw_response(raw_response)
+                    if not future.done():
+                        future.set_result(text_output)
+
+                    logger.info(f"Request {task_id} completed")
+
+            except asyncio.TimeoutError:
+                continue
+            except asyncio.CancelledError:
+                logger.info("Worker cancelled")
+                break
+            except Exception as e:
+                logger.error(f"Worker error: {e}", exc_info=True)
+                if task and "future" in task and not task["future"].done():
+                    task["future"].set_exception(e)
+            finally:
+                if task:
+                    self.queue.task_done()
+
+    async def start(self):
+        if self._running:
+            logger.warning("Worker already running")
+            return
+        self._running = True
+        self._worker_task = asyncio.create_task(self._worker())
+        self._worker_task.add_done_callback(self._worker_done_callback)
+        logger.info("Service started")
+
+    async def stop(self):
+        if not self._running:
+            return
+        logger.info("Stopping service...")
+        self._running = False
+        if self.config.graceful_shutdown:
+            # Wait for all pending tasks to finish
+            await self.queue.join()
+        if self._worker_task:
+            self._worker_task.cancel()
+            try:
+                await self._worker_task
+            except asyncio.CancelledError:
+                pass
+            self._worker_task = None
+        # Clear queue and fail pending futures
+        while not self.queue.empty():
+            try:
+                task = self.queue.get_nowait()
+                future = task.get("future")
+                if future and not future.done():
+                    future.set_exception(Exception("Service stopped"))
             except:
-                pass  # Not available on all platforms
-            
-            print(f"✅ Model '{model_name}' unloaded successfully")
-            return True
-            
-        except Exception as e:
-            print(f"❌ Error unloading model '{model_name}': {e}")
-            return False
+                break
+        logger.info("Service stopped")
 
-    def unload_all_models(self):
-        """
-        Unload all loaded models.
-        
-        Returns:
-            int: Number of models unloaded
-        """
-        count = len(self.current_model)
-        if count == 0:
-            print("No models loaded")
-            return 0
-        
-        print(f"Unloading all {count} model(s)...")
-        
-        for model_name in list(self.current_model.keys()):
-            self._unload_single_model(model_name)
-        
-        self.current_model.clear()
-        print(f"✅ Unloaded {count} model(s)")
-        return count
+    # ------------------------ Core APIs ------------------------
+    async def chat_llm(self, chat: str, chat_id: Optional[str] = None, timeout: float = None, **gen_kwargs) -> str:
+        if timeout is None:
+            timeout = self.config.default_timeout
+        if not self.current_model:
+            raise ValueError("No model loaded. Call _load_model() first.")
+        if not self._running:
+            raise RuntimeError("Service not started. Call start() first.")
 
-    def get_memory_usage(self):
-        """
-        Get current memory usage information.
-        
-        Returns:
-            dict: Memory usage stats
-        """
-        
-        
-        process = psutil.Process(os.getpid())
-        memory_info = process.memory_info()
-        
-        return {
-            "rss_mb": memory_info.rss / (1024 * 1024),
-            "vms_mb": memory_info.vms / (1024 * 1024),
-            "models_loaded": len(self.current_model),
-            "model_names": list(self.current_model.keys())
+        if self.config.reject_on_full_queue and self.queue.qsize() >= self.config.queue_maxsize:
+            raise asyncio.QueueFull(f"Queue is full (max {self.config.queue_maxsize}) – try again later")
+
+        task_id = chat_id or str(uuid4())[:12]
+        future = asyncio.Future()
+        if task_id in self.futures:
+            raise ValueError(f"Request ID '{task_id}' already in use")
+        self.futures[task_id] = future
+        self._metrics["total_requests"] += 1
+
+        # Merge per‑request generation parameters
+        task_params = {
+            "task_id": task_id,
+            "prompt": chat,
+            "future": future,
+            "timestamp": time.time(),
+            "stream": False,
         }
-        
+        # Allow overriding generation params per request
+        allowed_params = ["temperature", "top_p", "top_k", "max_tokens", "stop", "repeat_penalty"]
+        for p in allowed_params:
+            if p in gen_kwargs:
+                task_params[p] = gen_kwargs[p]
+
+        try:
+            await self.queue.put(task_params)
+            logger.info(f"Request {task_id} queued (position: {self.queue.qsize()})")
+            result = await asyncio.wait_for(future, timeout=timeout)
+            self._metrics["completed_requests"] += 1
+            return result
+        except Exception as e:
+            self._metrics["total_errors"] += 1
+            logger.error(f"Request {task_id} failed: {e}")
+            raise
+        finally:
+            self.futures.pop(task_id, None)
+
+    async def stream_llm(self, chat: str, chat_id: Optional[str] = None, timeout: float = None, **gen_kwargs):
+        if timeout is None:
+            timeout = self.config.default_timeout
+        if not self.current_model:
+            raise ValueError("No model loaded")
+        if not self._running:
+            raise RuntimeError("Service not started")
+
+        if self.config.reject_on_full_queue and self.queue.qsize() >= self.config.queue_maxsize:
+            raise asyncio.QueueFull(f"Queue is full (max {self.config.queue_maxsize}) – try again later")
+
+        task_id = chat_id or str(uuid4())[:12]
+        if task_id in self._active_streams:
+            raise ValueError(f"Stream ID '{task_id}' already active")
+        self._active_streams.add(task_id)
+        self._metrics["streaming_requests"] += 1
+        self._metrics["total_requests"] += 1
+
+        stream_queue = asyncio.Queue()
+        future = asyncio.Future()
+
+        task_params = {
+            "task_id": task_id,
+            "prompt": chat,
+            "future": future,
+            "timestamp": time.time(),
+            "stream": True,
+            "stream_queue": stream_queue,
+        }
+        allowed_params = ["temperature", "top_p", "top_k", "max_tokens", "stop", "repeat_penalty"]
+        for p in allowed_params:
+            if p in gen_kwargs:
+                task_params[p] = gen_kwargs[p]
+
+        await self.queue.put(task_params)
+
+        async def monitor():
+            try:
+                await future
+            except Exception as e:
+                await stream_queue.put(e)
+                await stream_queue.put(None)
+            finally:
+                self._active_streams.discard(task_id)
+
+        asyncio.create_task(monitor())
+
+        # Yield tokens with timeout per token
+        while True:
+            try:
+                token = await asyncio.wait_for(stream_queue.get(), timeout=timeout)
+            except asyncio.TimeoutError:
+                # Timeout while waiting for next token – stop the stream
+                if not future.done():
+                    future.set_exception(asyncio.TimeoutError(f"Stream timed out after {timeout}s"))
+                break
+            if token is None:
+                break
+            if isinstance(token, Exception):
+                raise token
+            yield token
+
+    # ------------------------ Parser helpers ------------------------
     def _extract_response_text(self, response):
-        """Fallback extraction when parser fails"""
         try:
             if isinstance(response, str):
                 return response.strip()
@@ -1194,370 +1135,116 @@ class AsyncLLM:
             return str(response)
         except Exception as e:
             return f"[Error extracting response: {e}]"
-    
-    
+
     def _parse_raw_response(self, raw_response):
-        """
-        LangChain‑style parsing of the raw LLM response.
-        Uses the configured output_parser to convert the raw response to a string.
-        Falls back to _extract_response_text if the parser fails.
-        """
         try:
-            # If the parser has a parse method (like StrOutputParser)
-            if hasattr(self.output_parser, 'parse'):
+            if hasattr(self.output_parser, "parse"):
                 return self.output_parser.parse(raw_response)
-            # If it's a callable
             elif callable(self.output_parser):
                 return self.output_parser(raw_response)
             else:
                 raise ValueError("output_parser not callable and has no parse method")
         except Exception as e:
-            # Fallback to the safe extraction method
-            print(f"⚠️ Parser failed, using fallback: {e}")
+            logger.warning(f"Parser failed, using fallback: {e}")
             return self._extract_response_text(raw_response)
-        
 
-    async def _worker(self):
-        """Background worker - robust response handling"""
-        while self._running:
-            task = None
-            try:
-                task = await asyncio.wait_for(self.queue.get(), timeout=1.0)
-                task_id = task["task_id"]
-                prompt = task["prompt"]
-                future = task["future"]
-                stream = task.get("stream", False)
-                stream_queue = task.get("stream_queue")
-
-                if not self.current_model:
-                    future.set_exception(ValueError("No model loaded"))
-                    continue
-                
-                model = list(self.current_model.values())[0]
-                
-                if stream:
-                    # ---------- STREAMING PATH ----------
-                    # Capture the current event loop for use in the thread
-                    loop = asyncio.get_running_loop()
-
-                    def generate():
-                        """Thread function that runs the model generator."""
-                        generator = model(
-                            prompt,
-                            max_tokens=self.n_predict,
-                            temperature=self.temperature,
-                            top_p=self.top_p,
-                            top_k=self.top_k,
-                            stream=True,
-                            stop=self.stops,
-                            repeat_penalty=self.repeat_penalty if self.repeat_penalty is not None else 1.0,
-                            # n_batch=self.n_batch,
-                            # n_ctx=self.n_ctx,
-                            # n_threads=self.n_threads,
-                            # n_gpu_layers=self.n_gpu_layers,
-                            # verbose=self.verbose,
-                        )
-                        try:
-                            for chunk in generator:
-                                token = chunk["choices"][0]["text"]
-                                # Put token into the async queue from the thread
-                                asyncio.run_coroutine_threadsafe(stream_queue.put(token), loop)
-                        except Exception as e:
-                            # If any exception occurs, put it into the queue
-                            asyncio.run_coroutine_threadsafe(stream_queue.put(e), loop)
-                        finally:
-                            # Signal end of stream
-                            asyncio.run_coroutine_threadsafe(stream_queue.put(None), loop)
-                            # Mark the future as done (optional, but helps monitor)
-                            if not future.done():
-                                loop.call_soon_threadsafe(future.set_result, None)
-
-                    # Run the generator in a thread. This will block the worker until the generator finishes.
-                    await asyncio.to_thread(generate)
-                else:
-                    print(f"⚙️ [{task_id}] Processing: {prompt[:50]}...")
-                    
-                    
-                    raw_response = await asyncio.to_thread(
-                        model, 
-                        prompt, 
-                        max_tokens=self.n_predict,
-                        temperature=self.temperature,
-                        top_p=self.top_p,
-                        top_k=self.top_k 
-                        
-                    )
-                    if isinstance(raw_response, dict) and "choices" in raw_response:
-                        choice = raw_response["choices"][0]
-                        finish_reason = choice.get("finish_reason")
-                        
-                        if finish_reason == "length":
-                            print(f"⚠️ [{task_id}] Stopped due to max_tokens limit ({self.n_predict})")
-                        elif finish_reason == "stop":
-                            print(f"✅ [{task_id}] Stopped by stop token")
-                        elif finish_reason:
-                            print(f"ℹ️ [{task_id}] Finish reason: {finish_reason}")
-                    # SAFE EXTRACTION
-                    text_output = self._parse_raw_response(raw_response)
-                    
-                    if not future.done():
-                        future.set_result(text_output)
-                    
-                    print(f"✅ [{task_id}] Completed")
-                
-            except asyncio.TimeoutError:
-                continue
-            except asyncio.CancelledError:
-                print("Worker cancelled")
-                break
-            except Exception as e:
-                print(f"❌ Worker error: {e}")
-                # Only set exception if future exists and not done
-                if task and 'future' in task and not task['future'].done():
-                    task['future'].set_exception(e)
-            finally:
-                if task:
-                    self.queue.task_done() 
-    
-    
-    async def start(self):
-        """Start the worker"""
-        if self._running:
-            print("Worker already running")
-            return
-        
-        self._running = True
-        self._worker_task = asyncio.create_task(self._worker())
-        self._worker_task.add_done_callback(self._worker_done_callback)
-        print("🚀 Service started")
-    
-    # ========== STOP METHOD ==========
-    async def stop(self):
-        """Stop the worker gracefully"""
-        if not self._running:
-            return
-        
-        self._running = False
-   
-        if self._worker_task:
-            self._worker_task.cancel()
-            try:
-                await self._worker_task
-            except asyncio.CancelledError:
-                pass
-            self._worker_task = None
- 
-        # Clear pending futures from queue (not self.futures dict)
-        while not self.queue.empty():
-            try:
-                task = self.queue.get_nowait()
-                future = task.get("future")
-                if future and not future.done():
-                    future.set_exception(Exception("Service stopped"))
-            except:
-                break
-        
-        print("🛑 Service stopped")
-    
-    def _validate_queue(self):
-        """Check queue status and warn if near capacity"""
-        if self.queue.qsize() >= self.queue.maxsize:
-            print(f"⚠️ Queue is FULL ({self.queue.qsize()}/{self.queue.maxsize})!")
-            return False
-        return True
-    
-    # ========== CHAT METHOD ==========
-    async def chat_llm(self, chat: str,chat_id:Optional[str]=None,timeout:float=160.0) -> str:
-        """    Send a message to the LLM with optional custom request ID.
-    
-    Args:
-        chat: The user message/prompt to send
-        chat_id: Optional custom ID for tracking this request.
-                 If not provided, auto-generates a UUID.
-        timeout: Maximum time to wait for response in seconds.
-                 Default: 160.0
-    
-    Returns:
-        The LLM's response as a string
-    
-    Examples:
-        >>> # Auto-generate ID
-        >>> response = await llm.chat_llm("Hello")
-        
-        >>> # Custom ID for tracking
-        >>> response = await llm.chat_llm("Hello", chat_id="user_123")
-        
-        >>> # Custom timeout
-        >>> response = await llm.chat_llm("Long essay", timeout=300.0)"""
-        try:
-            task_id=None
-            if not self.current_model:
-                raise ValueError("No model loaded. Call _load_model() first.")
-            
-            if not self._running:
-                raise RuntimeError("Service not started. Call start() first.")
-            if self.queue.qsize() >= self.queue.maxsize * 0.8:
-                print(f"⚠️ Queue is {self.queue.qsize()}/{self.queue.maxsize} - consider reducing load")
-            if chat_id:
-                task_id=chat_id
-            else:
-                task_id = str(uuid4())[:12]
-            future = asyncio.Future()
-            if task_id in self.futures:
-                raise ValueError(f"Request ID '{task_id}' is already in use. Use a unique ID.")
-            self.futures[task_id] = future
-            
-            await self.queue.put({
-                "task_id": task_id,
-                "prompt": chat,
-                "future": future,
-                "timestamp": time.time()
-            })
-            
-            print(f"📝 [{task_id}] Queued (position: {self.queue.qsize()})")
-            
-            return await asyncio.wait_for(future, timeout=timeout)
-
-            
-        except Exception as e:
-            print(f"❌ Error in chat: {e}")
-            raise
-        finally:
-            if 'task_id' in locals() and task_id in self.futures:
-                self.futures.pop(task_id, None)
-                print(f"🗑️ [{task_id}] Future cleaned from memory")
-
-
-    async def stream_llm(self, chat: str, chat_id: Optional[str] = None):
-        if not self.current_model:
-            raise ValueError("No model loaded. Call _load_model() first.")
-        if not self._running:
-            raise RuntimeError("Service not started. Call start() first.")
-
-        # --- Add queue warning (same as chat_llm) ---
-        if self.queue.qsize() >= self.queue.maxsize * 0.8:
-            print(f"⚠️ Queue is {self.queue.qsize()}/{self.queue.maxsize} - consider reducing load")
-
-        task_id = chat_id or str(uuid4())[:12]
-        
-        # --- Optional: track active stream IDs to avoid collisions ---
-        # You need to add: self._active_streams = set() in __init__
-        if task_id in self._active_streams:
-            raise ValueError(f"Stream ID '{task_id}' is already active.")
-        self._active_streams.add(task_id)
-
-        stream_queue = asyncio.Queue()
-        future = asyncio.Future()
-
-        # Put the task into the main queue
-        await self.queue.put({
-            "task_id": task_id,
-            "prompt": chat,
-            "future": future,
-            "timestamp": time.time(),
-            "stream": True,
-            "stream_queue": stream_queue,
-        })
-
-        async def monitor():
-            try:
-                # Wait for the worker to finish the stream
-                await future
-            except Exception as e:
-                await stream_queue.put(e)
-                await stream_queue.put(None)
-            finally:
-                # Clean up the active stream ID
-                self._active_streams.discard(task_id)
-
-        asyncio.create_task(monitor())
-
-        # Yield tokens
-        while True:
-            token = await stream_queue.get()
-            if token is None:
-                break
-            if isinstance(token, Exception):
-                raise token
-            yield token
-
-    
+    # ------------------------ Runnable interface ------------------------
     async def ainvoke(self, input: Union[str, Dict]) -> str:
-        """Async invoke for chaining"""
-        if isinstance(input, dict):
-            prompt = input.get("input", str(input))
-            chat_id = input.get("chat_id")  # Optional
-            timeout = input.get("timeout", 160.0)  # Optional custom timeout
-        else:
-            prompt = str(input)
-            chat_id = None  # ← ADD THIS
-            timeout = 160.0  # ← ADD THIS
-        return await self.chat_llm(prompt,chat_id=chat_id,timeout=timeout)
-    
-    
-    def invoke(self, input: Union[str, Dict]) -> str:
-        """Sync invoke - runs LLM"""
         if isinstance(input, dict):
             prompt = input.get("input", str(input))
             chat_id = input.get("chat_id")
-            timeout = input.get("timeout", 160.0)
+            timeout = input.get("timeout", self.config.default_timeout)
+            # Extract any generation kwargs from the dict
+            gen_kwargs = {k: v for k, v in input.items() if k in ["temperature", "top_p", "top_k", "max_tokens", "stop", "repeat_penalty"]}
         else:
             prompt = str(input)
             chat_id = None
-            timeout = 160.0
-        
+            timeout = self.config.default_timeout
+            gen_kwargs = {}
+        return await self.chat_llm(prompt, chat_id=chat_id, timeout=timeout, **gen_kwargs)
+
+    def invoke(self, input: Union[str, Dict]) -> str:
         try:
-            # Try to run in existing loop
             loop = asyncio.get_running_loop()
         except RuntimeError:
-            # No running loop, create new one
-            return asyncio.run(self.chat_llm(prompt, chat_id, timeout))
+            return asyncio.run(self.ainvoke(input))
         else:
-            # ✅ Already in async context - need to pass chat_id and timeout!
-            return loop.run_until_complete(self.chat_llm(prompt, chat_id, timeout))    
-    # def invoke(self, input: Union[str, Dict]) -> str:
-    #     """Sync invoke - runs LLM"""
-    #     if isinstance(input, dict):
-    #         prompt = input.get("input", str(input))
-    #         chat_id = input.get("chat_id")  # Optional
-    #         timeout = input.get("timeout", 160.0)  # Optional custom timeout
-    #     else:
-    #         prompt = str(input)
-    #         chat_id = None  # ← ADD THIS
-    #         timeout = 160.0  # ← ADD THIS
-    #     try:
-    #         # Try to run in existing loop
-    #         loop = asyncio.get_running_loop()
-    #     except RuntimeError:
-    #         # No running loop, create new one
-    #         return asyncio.run(self.chat_llm(prompt,chat_id,timeout))
-    #     else:
-    #         # Already in async context
-    #         return loop.run_until_complete(self.chat_llm(prompt))
-    
+            return loop.run_until_complete(self.ainvoke(input))
+
     def __or__(self, other):
         async def chained(value):
-            response = await self.ainvoke(value)  # Use ainvoke
-            if hasattr(other, 'ainvoke'):
+            response = await self.ainvoke(value)
+            if hasattr(other, "ainvoke"):
                 return await other.ainvoke(response)
-            elif hasattr(other, 'invoke'):
+            elif hasattr(other, "invoke"):
                 return other.invoke(response)
             elif callable(other):
                 return await other(response) if asyncio.iscoroutinefunction(other) else other(response)
             return response
         return Runnable(chained)
-    
-    
+
     def __ror__(self, other):
-        """prompt | llm"""
         if callable(other):
             async def chained(value):
                 processed = other(value)
                 return await self.ainvoke(processed)
             return chained
         return self
-    
-    
+
     async def __call__(self, input: Union[str, Dict]) -> str:
-        """Make the instance callable directly"""
         return await self.ainvoke(input)
+
+    # ------------------------ Unload and memory ------------------------
+    def get_loaded_models(self) -> List[str]:
+        return list(self.current_model.keys())
+
+    def unload_model(self, model_name: str = None):
+        if model_name is None:
+            for name in list(self.current_model.keys()):
+                self._unload_single_model(name)
+            self.current_model.clear()
+            logger.info("Unloaded all models")
+            return True
+        if model_name not in self.current_model:
+            raise ValueError(f"Model '{model_name}' not loaded")
+        return self._unload_single_model(model_name)
+
+    def _unload_single_model(self, model_name: str) -> bool:
+        try:
+            logger.info(f"Unloading model: {model_name}")
+            model = self.current_model.get(model_name)
+            if model and hasattr(model, "close"):
+                try:
+                    model.close()
+                except:
+                    pass
+            del self.current_model[model_name]
+            gc.collect()
+            try:
+                libc = ctypes.CDLL("libc.so.6")
+                libc.malloc_trim(0)
+            except:
+                pass
+            logger.info(f"Model {model_name} unloaded")
+            return True
+        except Exception as e:
+            logger.error(f"Error unloading {model_name}: {e}")
+            return False
+
+    def unload_all_models(self):
+        count = len(self.current_model)
+        for name in list(self.current_model.keys()):
+            self._unload_single_model(name)
+        self.current_model.clear()
+        logger.info(f"Unloaded {count} models")
+        return count
+
+    def get_memory_usage(self):
+        process = psutil.Process(os.getpid())
+        mem = process.memory_info()
+        return {
+            "rss_mb": mem.rss / (1024 * 1024),
+            "vms_mb": mem.vms / (1024 * 1024),
+            "models_loaded": len(self.current_model),
+            "model_names": list(self.current_model.keys())
+        }
