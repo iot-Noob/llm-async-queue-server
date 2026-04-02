@@ -817,6 +817,7 @@ class AsyncLLM:
         Runnable : Base class for chainable components
         """
         self.available_ram=kwargs.get("available_ram",3000)
+        self._active_streams: set = set()   # <-- ADD THIS LINE
         self.setting=Settings()
         self.model_path=kwargs.get("model_path")
         self._worker_exception_callback = kwargs.get("worker_exception_callback", None)
@@ -1193,6 +1194,8 @@ class AsyncLLM:
             return str(response)
         except Exception as e:
             return f"[Error extracting response: {e}]"
+    
+    
     def _parse_raw_response(self, raw_response):
         """
         LangChain‑style parsing of the raw LLM response.
@@ -1213,6 +1216,7 @@ class AsyncLLM:
             print(f"⚠️ Parser failed, using fallback: {e}")
             return self._extract_response_text(raw_response)
         
+
     async def _worker(self):
         """Background worker - robust response handling"""
         while self._running:
@@ -1222,43 +1226,84 @@ class AsyncLLM:
                 task_id = task["task_id"]
                 prompt = task["prompt"]
                 future = task["future"]
-                
+                stream = task.get("stream", False)
+                stream_queue = task.get("stream_queue")
+
                 if not self.current_model:
                     future.set_exception(ValueError("No model loaded"))
                     continue
                 
                 model = list(self.current_model.values())[0]
                 
-                print(f"⚙️ [{task_id}] Processing: {prompt[:50]}...")
-                
-                # Run inference
-                raw_response = await asyncio.to_thread(
-                    model, 
-                    prompt, 
-                    max_tokens=self.n_predict,
-                    temperature=self.temperature,
-                    top_p=self.top_p,
-                    top_k=self.top_k,
-                    # Remove stream if you don't handle it
-                    stream=self.streaming,  
-                )
-                if isinstance(raw_response, dict) and "choices" in raw_response:
-                    choice = raw_response["choices"][0]
-                    finish_reason = choice.get("finish_reason")
+                if stream:
+                    # ---------- STREAMING PATH ----------
+                    # Capture the current event loop for use in the thread
+                    loop = asyncio.get_running_loop()
+
+                    def generate():
+                        """Thread function that runs the model generator."""
+                        generator = model(
+                            prompt,
+                            max_tokens=self.n_predict,
+                            temperature=self.temperature,
+                            top_p=self.top_p,
+                            top_k=self.top_k,
+                            stream=True,
+                            stop=self.stops,
+                            repeat_penalty=self.repeat_penalty if self.repeat_penalty is not None else 1.0,
+                            # n_batch=self.n_batch,
+                            # n_ctx=self.n_ctx,
+                            # n_threads=self.n_threads,
+                            # n_gpu_layers=self.n_gpu_layers,
+                            # verbose=self.verbose,
+                        )
+                        try:
+                            for chunk in generator:
+                                token = chunk["choices"][0]["text"]
+                                # Put token into the async queue from the thread
+                                asyncio.run_coroutine_threadsafe(stream_queue.put(token), loop)
+                        except Exception as e:
+                            # If any exception occurs, put it into the queue
+                            asyncio.run_coroutine_threadsafe(stream_queue.put(e), loop)
+                        finally:
+                            # Signal end of stream
+                            asyncio.run_coroutine_threadsafe(stream_queue.put(None), loop)
+                            # Mark the future as done (optional, but helps monitor)
+                            if not future.done():
+                                loop.call_soon_threadsafe(future.set_result, None)
+
+                    # Run the generator in a thread. This will block the worker until the generator finishes.
+                    await asyncio.to_thread(generate)
+                else:
+                    print(f"⚙️ [{task_id}] Processing: {prompt[:50]}...")
                     
-                    if finish_reason == "length":
-                        print(f"⚠️ [{task_id}] Stopped due to max_tokens limit ({self.n_predict})")
-                    elif finish_reason == "stop":
-                        print(f"✅ [{task_id}] Stopped by stop token")
-                    elif finish_reason:
-                        print(f"ℹ️ [{task_id}] Finish reason: {finish_reason}")
-                # SAFE EXTRACTION
-                text_output = self._parse_raw_response(raw_response)
-                
-                if not future.done():
-                    future.set_result(text_output)
-                
-                print(f"✅ [{task_id}] Completed")
+                    
+                    raw_response = await asyncio.to_thread(
+                        model, 
+                        prompt, 
+                        max_tokens=self.n_predict,
+                        temperature=self.temperature,
+                        top_p=self.top_p,
+                        top_k=self.top_k 
+                        
+                    )
+                    if isinstance(raw_response, dict) and "choices" in raw_response:
+                        choice = raw_response["choices"][0]
+                        finish_reason = choice.get("finish_reason")
+                        
+                        if finish_reason == "length":
+                            print(f"⚠️ [{task_id}] Stopped due to max_tokens limit ({self.n_predict})")
+                        elif finish_reason == "stop":
+                            print(f"✅ [{task_id}] Stopped by stop token")
+                        elif finish_reason:
+                            print(f"ℹ️ [{task_id}] Finish reason: {finish_reason}")
+                    # SAFE EXTRACTION
+                    text_output = self._parse_raw_response(raw_response)
+                    
+                    if not future.done():
+                        future.set_result(text_output)
+                    
+                    print(f"✅ [{task_id}] Completed")
                 
             except asyncio.TimeoutError:
                 continue
@@ -1273,6 +1318,8 @@ class AsyncLLM:
             finally:
                 if task:
                     self.queue.task_done() 
+    
+    
     async def start(self):
         """Start the worker"""
         if self._running:
@@ -1379,6 +1426,62 @@ class AsyncLLM:
             if 'task_id' in locals() and task_id in self.futures:
                 self.futures.pop(task_id, None)
                 print(f"🗑️ [{task_id}] Future cleaned from memory")
+
+
+    async def stream_llm(self, chat: str, chat_id: Optional[str] = None):
+        if not self.current_model:
+            raise ValueError("No model loaded. Call _load_model() first.")
+        if not self._running:
+            raise RuntimeError("Service not started. Call start() first.")
+
+        # --- Add queue warning (same as chat_llm) ---
+        if self.queue.qsize() >= self.queue.maxsize * 0.8:
+            print(f"⚠️ Queue is {self.queue.qsize()}/{self.queue.maxsize} - consider reducing load")
+
+        task_id = chat_id or str(uuid4())[:12]
+        
+        # --- Optional: track active stream IDs to avoid collisions ---
+        # You need to add: self._active_streams = set() in __init__
+        if task_id in self._active_streams:
+            raise ValueError(f"Stream ID '{task_id}' is already active.")
+        self._active_streams.add(task_id)
+
+        stream_queue = asyncio.Queue()
+        future = asyncio.Future()
+
+        # Put the task into the main queue
+        await self.queue.put({
+            "task_id": task_id,
+            "prompt": chat,
+            "future": future,
+            "timestamp": time.time(),
+            "stream": True,
+            "stream_queue": stream_queue,
+        })
+
+        async def monitor():
+            try:
+                # Wait for the worker to finish the stream
+                await future
+            except Exception as e:
+                await stream_queue.put(e)
+                await stream_queue.put(None)
+            finally:
+                # Clean up the active stream ID
+                self._active_streams.discard(task_id)
+
+        asyncio.create_task(monitor())
+
+        # Yield tokens
+        while True:
+            token = await stream_queue.get()
+            if token is None:
+                break
+            if isinstance(token, Exception):
+                raise token
+            yield token
+
+    
     async def ainvoke(self, input: Union[str, Dict]) -> str:
         """Async invoke for chaining"""
         if isinstance(input, dict):
@@ -1390,6 +1493,7 @@ class AsyncLLM:
             chat_id = None  # ← ADD THIS
             timeout = 160.0  # ← ADD THIS
         return await self.chat_llm(prompt,chat_id=chat_id,timeout=timeout)
+    
     
     def invoke(self, input: Union[str, Dict]) -> str:
         """Sync invoke - runs LLM"""
@@ -1443,6 +1547,7 @@ class AsyncLLM:
             return response
         return Runnable(chained)
     
+    
     def __ror__(self, other):
         """prompt | llm"""
         if callable(other):
@@ -1451,6 +1556,8 @@ class AsyncLLM:
                 return await self.ainvoke(processed)
             return chained
         return self
+    
+    
     async def __call__(self, input: Union[str, Dict]) -> str:
         """Make the instance callable directly"""
         return await self.ainvoke(input)
