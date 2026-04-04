@@ -1,6 +1,6 @@
 # 🚀 Async LLM Engine – Production-Ready LLM Serving with LangChain & FastAPI
 
-![Python Version](https://img.shields.io/badge/python-3.10+-blue.svg)
+![Python Version](https://img.shields.io/badge/python-3.10.19-blue.svg)
 ![License](https://img.shields.io/badge/license-MIT-green.svg)
 ![Async](https://img.shields.io/badge/async-uvloop-brightgreen.svg)
 ![LangChain](https://img.shields.io/badge/LangChain-integrated-orange.svg)
