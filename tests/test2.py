@@ -3,7 +3,6 @@ import sys
 # Add parent directory to path so Python can find main.py
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-
 from main import PromptTemplate, AsyncLLM, StrOutputParser
 import asyncio
 from uuid import uuid4
@@ -14,7 +13,7 @@ async def main():
         llm = AsyncLLM()
         queue = asyncio.Queue(maxsize=11)
         
-        # Load model
+        # Load model FIRST (before start)
         await llm._load_model(   
             model_name="qwen2.5-coder-7b-instruct-q4_k_m.gguf",
             temperature=0.6,
@@ -23,6 +22,8 @@ async def main():
             streaming=False,
             stop=["<|im_end|>"]
         )
+        
+        # Start the service (requires model loaded)
         await llm.start()
         
         parser = StrOutputParser()
@@ -93,7 +94,7 @@ You are a helpful assistant. Provide accurate, informative responses.<|im_end|>
                 print(f"Queue size: {queue.qsize()}")
                 continue
             
-            # 🔥 FIRE AND FORGET - response will print when ready
+            # FIRE AND FORGET - response will print when ready
             async def respond(msg=user_input):
                 response = await add_to_queue(msg)
                 # Print response cleanly, then re-show prompt
@@ -107,11 +108,17 @@ You are a helpful assistant. Provide accurate, informative responses.<|im_end|>
         running = False
         worker_task.cancel()
         await asyncio.gather(worker_task, return_exceptions=True)
+        
+        # Stop the service (will wait for active requests)
         await llm.stop()
-        llm.unload_all_models()
+        
+        # Unload models (now safe since service is stopped)
+        await llm.unload_all_models()
         
     except Exception as e:
         print(f"Error: {e}")
+        import traceback
+        traceback.print_exc()
 
 if __name__ == "__main__":
     asyncio.run(main())
