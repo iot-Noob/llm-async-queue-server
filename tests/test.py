@@ -8,6 +8,14 @@ from main import PromptTemplate, AsyncLLM, PydanticOutputParser
 import asyncio
 
 async def main():
+
+    class Data(BaseModel):
+        name: str = Field(description="name of user")
+        age: int = Field(description="age of person")
+
+    # Create parser
+    parser = PydanticOutputParser(pydantic_object=Data)
+    # Decoupled: No parser passed to AsyncLLM
     llm = AsyncLLM()
     
     await llm._load_model(   
@@ -20,12 +28,7 @@ async def main():
     )
     await llm.start()
 
-    class Data(BaseModel):
-        name: str = Field(description="name of user")
-        age: int = Field(description="age of person")
 
-    # Create parser
-    parser = PydanticOutputParser(pydantic_object=Data)
     
     # Get format instructions
     format_instructions = parser.get_format_instructions()
@@ -33,34 +36,44 @@ async def main():
     # ✅ Fixed: Use proper ChatML format and include format_instructions
     pt = PromptTemplate(
         template="""<|im_start|>system
-You are a helpful assistant. Generate ONLY valid JSON matching the schema below.
-{format_instructions}<|im_end|>
-<|im_start|>user
-{input}<|im_end|>
-<|im_start|>assistant
-""",
+                    You are a helpful assistant. Generate ONLY valid JSON matching the schema below.
+                    {format_instructions}<|im_end|>
+                    <|im_start|>user
+                    {input}<|im_end|>
+                    <|im_start|>assistant
+                    """,
         input_variables=["input", "format_instructions"]
     )
     
-    # ✅ Fixed: Add parser to chain
+    # 1. Testing Raw AIMessage (Returns object with metadata)
+    res = await llm.ainvoke({
+        "input": "What you know about zionism",
+    })
+    
+    print("\n--- [1] AIMessage Discovery ---")
+    print(f"Result Type: {type(res)}")
+    print(f"Content Preview: {str(res)[:100]}...")
+    
+    # This is the "Raw Response with all params" you're looking for:
+    print("\n--- Full Raw Response Metadata ---")
+    import json
+    print(json.dumps(res.response_metadata, indent=2))
+    # 2. Testing Piped Chain (Decoupled Parsing)    
+    print("\n--- [2] Piped Chain (Prompt | LLM | Parser) ---")
+    # Link the components: Template -> LLM -> Parser
     chain = pt | llm | parser
     
-    res = await chain.ainvoke({
-        "input": "Create a random user with a name and age",
-        "chat_id": "talha_id_69",
+    parsed_res = await chain.ainvoke({
+        "input": "My name is Talha and I am 30 years old",
         "format_instructions": format_instructions
     })
     
-    # ✅ Now res is a Data object (Pydantic model)
-    print("\n" + "="*60)
-    print("📊 PARSED RESULT")
-    print("="*60)
-    print(f"Name: {res.name}")
-    print(f"Age: {res.age}")
-    print(f"Type: {type(res)}")
+    print(f"Parsed Type: {type(parsed_res)}")
+    print(f"Parsed Data: {parsed_res}")
+ 
     
     await llm.stop()
-    llm.unload_all_models()
+    await llm.unload_all_models()
 
 if __name__ == "__main__":
     asyncio.run(main())

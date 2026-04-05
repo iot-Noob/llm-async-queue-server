@@ -3,17 +3,12 @@ from pydantic import BaseModel, Field,field_validator,ConfigDict,ValidationError
 from pydantic import ValidationError as PydanticValidationError
 from pydantic_settings import BaseSettings
 import gc
-import ctypes
 import os
-from langchain.embeddings import Embeddings
-from langchain_community.retrievers import WikipediaRetriever
 from uuid import uuid4
 import asyncio
 from typing import Dict, List, Union, Any, Optional, Tuple, Type, TypeVar, Generic
-from queue import Queue
 import psutil
 import json
-import shutil
 import re
 from enum import Enum
 from dataclasses import dataclass,field
@@ -30,7 +25,7 @@ class EcharrParsers:
         self.all_charts_list: List[str] = [] 
         fp = os.path.join(cdir, "Charts.json")
         if not os.path.exists(fp):
-            raise ValueError(f"Error file not found Charts.json")
+            raise ValueError("Error file not found Charts.json")
         try:
             with open(fp, 'r') as f:
                 self.cj = json.load(f)
@@ -200,16 +195,23 @@ class Runnable:
 
 class StrOutputParser:
     def parse(self, response):
-        # CHANGE: Return raw string, don't try to parse JSON
+        # Extract content if response is an AIMessage
+        if hasattr(response, "content"):
+            response = response.content
+            
         if isinstance(response, str):
-            return response.strip()  # Just strip, don't json.loads
+            return response.strip()
         
         if isinstance(response, dict):
             if "choices" in response and len(response["choices"]) > 0:
-                return response["choices"][0].get("text", "").strip()
+                choice = response["choices"][0]
+                if "text" in choice:
+                    return choice.get("text", "").strip()
+                if "message" in choice and "content" in choice["message"]:
+                    return choice["message"]["content"].strip()
             if "text" in response:
                 return response["text"].strip()
-            return json.dumps(response)  # Convert dict to string
+            return json.dumps(response)
         
         return str(response).strip()
     
@@ -404,6 +406,18 @@ class ChatPromptTemplate:
         """Create simple template from one string"""
         return cls([("human", template)])
 
+class AIMessage(BaseModel):
+    """Message from an AI."""
+    content: str
+    response_metadata: Dict[str, Any] = Field(default_factory=dict)
+    
+    def __str__(self):
+        return self.content
+    
+    def __getitem__(self, key):
+        """Allow dict-like access for backward compatibility"""
+        return getattr(self, key) if hasattr(self, key) else self.response_metadata.get(key)
+
 T = TypeVar('T', bound=BaseModel)
 
 class JsonOutputParser:
@@ -423,17 +437,17 @@ class JsonOutputParser:
     def parse(self, response):
         """Parse raw LLM response into JSON/dict"""
         import re
-        
+        # Extract content if response is an AIMessage
+        if hasattr(response, "content"):
+            response = response.content
+
         if isinstance(response, str):
             text = response.strip()
             
-            # Remove markdown code blocks - same regex pattern LangChain uses [citation:1]
-            # Pattern: ```json ... ``` or ``` ... ```
+            # Remove markdown code blocks
             match = re.search(r'```(?:json)?\s*(.*?)\s*```', text, re.DOTALL)
             if match:
                 text = match.group(1).strip()
-            
-            # Try to find JSON directly if no markdown blocks
             else:
                 json_match = re.search(r'\{.*\}', text, re.DOTALL)
                 if json_match:
@@ -445,7 +459,7 @@ class JsonOutputParser:
             except json.JSONDecodeError as e:
                 raise ValueError(f"Failed to parse JSON: {e}\nResponse: {text[:200]}")
             
-            # Validate with Pydantic if provided [citation:5][citation:8]
+            # Validate with Pydantic if provided
             if self.pydantic_object:
                 try:
                     return self.pydantic_object(**parsed)
@@ -766,7 +780,6 @@ class AsyncLLM:
         self.n_gpu_layers = kwargs.get("n_gpu_layers", -1)
         self.verbose = kwargs.get("verbose", False)
         self.stops = kwargs.get("stop", ["<|endoftext|>", "<|im_end|>"])
-        self.output_parser = kwargs.get("output_parser")
         self._stream_lock = asyncio.Lock()
         self._stream_tasks: Dict[str, asyncio.Task] = {}
         # ✅ FIXED: Added missing attributes
@@ -965,9 +978,11 @@ class AsyncLLM:
                             elif finish_reason == "stop":
                                 logger.info(f"Request {task_id} stopped by stop token")
                         
-                        text_output = self._parse_raw_response(raw_response)
                         if not future.done():
-                            future.set_result(text_output)
+                            # Create AIMessage with content and full raw response as metadata
+                            content = self._extract_content(raw_response)
+                            message = AIMessage(content=content, response_metadata=raw_response)
+                            future.set_result(message)
                         logger.info(f"Request {task_id} completed")
                 finally:
                     # ✅ Always release model
@@ -1058,7 +1073,22 @@ class AsyncLLM:
         logger.info(f"Service stopped. Failed {failed_count} pending requests.")
 
     # ------------------------ Core APIs ------------------------
-    async def chat_llm(self, chat: str, chat_id: Optional[str] = None, timeout: float = None, **gen_kwargs) -> str:
+    def _extract_content(self, response: Any) -> str:
+        """Helper to extract text content from raw response dict"""
+        if isinstance(response, str):
+            return response.strip()
+        if isinstance(response, dict):
+            if "choices" in response and response["choices"]:
+                choice = response["choices"][0]
+                if "text" in choice:
+                    return choice["text"].strip()
+                if "message" in choice and "content" in choice["message"]:
+                    return choice["message"]["content"].strip()
+            if "message" in response and "content" in response["message"]:
+                return response["message"]["content"].strip()
+        return str(response)
+
+    async def chat_llm(self, chat: str, chat_id: Optional[str] = None, timeout: float = None, **gen_kwargs) -> AIMessage:
         if timeout is None:
             timeout = self.config.default_timeout
         
@@ -1197,37 +1227,8 @@ class AsyncLLM:
                 pass
             async with self._stream_lock:
                 self._active_streams.discard(task_id)
-    # ------------------------ Parser helpers ------------------------
-    def _extract_response_text(self, response):
-        try:
-            if isinstance(response, str):
-                return response.strip()
-            elif isinstance(response, dict):
-                if "choices" in response and response["choices"]:
-                    choice = response["choices"][0]
-                    if "text" in choice:
-                        return choice["text"].strip()
-                    if "message" in choice and "content" in choice["message"]:
-                        return choice["message"]["content"].strip()
-                return json.dumps(response)
-            return str(response)
-        except Exception as e:
-            return f"[Error extracting response: {e}]"
-
-    def _parse_raw_response(self, raw_response):
-        try:
-            if hasattr(self.output_parser, "parse"):
-                return self.output_parser.parse(raw_response)
-            elif callable(self.output_parser):
-                return self.output_parser(raw_response)
-            else:
-                raise ValueError("output_parser not callable and has no parse method")
-        except Exception as e:
-            logger.warning(f"Parser failed, using fallback: {e}")
-            return self._extract_response_text(raw_response)
-
     # ------------------------ Runnable interface ------------------------
-    async def ainvoke(self, input: Union[str, Dict]) -> str:
+    async def ainvoke(self, input: Union[str, Dict]) -> AIMessage:
         if isinstance(input, dict):
             prompt = input.get("input", str(input))
             chat_id = input.get("chat_id")
@@ -1311,7 +1312,7 @@ class AsyncLLM:
             if model and hasattr(model, "close"):
                 try:
                     model.close()
-                except:
+                except Exception:
                     pass
             loop = asyncio.get_event_loop()
             await loop.run_in_executor(None, self._gc_cleanup)
@@ -1321,7 +1322,6 @@ class AsyncLLM:
             logger.error(f"Error unloading {model_name}: {e}")
             return False
     def _gc_cleanup(self):
-        import gc
         gc.collect()
         import sys
         if sys.platform.startswith('linux'):
