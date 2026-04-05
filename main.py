@@ -766,7 +766,7 @@ class AsyncLLM:
         self.n_gpu_layers = kwargs.get("n_gpu_layers", -1)
         self.verbose = kwargs.get("verbose", False)
         self.stops = kwargs.get("stop", ["<|endoftext|>", "<|im_end|>"])
-        self.output_parser = kwargs.get("output_parser", StrOutputParser())
+        self.output_parser = kwargs.get("output_parser")
         self._stream_lock = asyncio.Lock()
         self._stream_tasks: Dict[str, asyncio.Task] = {}
         # ✅ FIXED: Added missing attributes
