@@ -917,6 +917,8 @@ class AsyncLLM:
                 future = task["future"]
                 stream = task.get("stream", False)
                 stream_queue = task.get("stream_queue")
+                model_id=task.get("model_id")
+                user_id=task.get("user_id")
                 # ✅ Acquire model with counter
                 try:
                     model = await self._acquire_model()
@@ -981,7 +983,12 @@ class AsyncLLM:
                         if not future.done():
                             # Create AIMessage with content and full raw response as metadata
                             content = self._extract_content(raw_response)
-                            message = AIMessage(content=content, response_metadata=raw_response)
+                            message = AIMessage(content=content, response_metadata={
+                                **raw_response,
+                                "model_id":model_id,
+                                "user_id":user_id,
+                                "task_id":task_id
+                            })
                             future.set_result(message)
                         logger.info(f"Request {task_id} completed")
                 finally:
@@ -1117,7 +1124,7 @@ class AsyncLLM:
             "timestamp": time.time(),
             "stream": False,
         }
-        allowed_params = ["temperature", "top_p", "top_k", "max_tokens", "stop", "repeat_penalty"]
+        allowed_params = ["temperature", "top_p", "top_k", "max_tokens", "stop", "repeat_penalty","model_id","user_id"]
         for p in allowed_params:
             if p in gen_kwargs:
                 task_params[p] = gen_kwargs[p]
@@ -1183,7 +1190,7 @@ class AsyncLLM:
             "stream": True,
             "stream_queue": stream_queue,
         }
-        allowed_params = ["temperature", "top_p", "top_k", "max_tokens", "stop", "repeat_penalty"]
+        allowed_params = ["temperature", "top_p", "top_k", "max_tokens", "stop", "repeat_penalty","model_id","user_id"]
         for p in allowed_params:
             if p in gen_kwargs:
                 task_params[p] = gen_kwargs[p]
@@ -1233,7 +1240,7 @@ class AsyncLLM:
             prompt = input.get("input", str(input))
             chat_id = input.get("chat_id")
             timeout = input.get("timeout", self.config.default_timeout)
-            gen_kwargs = {k: v for k, v in input.items() if k in ["temperature", "top_p", "top_k", "max_tokens", "stop", "repeat_penalty"]}
+            gen_kwargs = {k: v for k, v in input.items() if k in ["temperature", "top_p", "top_k", "max_tokens", "stop", "repeat_penalty","user_id", "model_id"]}
         else:
             prompt = str(input)
             chat_id = None
