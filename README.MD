@@ -1,3 +1,4 @@
+# ![Version](https://img.shields.io/badge/version-v1.0.0-blue.svg)
 # 🚀 Async LLM Engine – Production-Ready LLM Serving with LangChain & FastAPI
 
 ![Python Version](https://img.shields.io/badge/python-3.10.19-blue.svg)
