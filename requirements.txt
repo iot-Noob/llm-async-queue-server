@@ -9,6 +9,7 @@ sentence-transformers
 huggingface-hub
 pydantic
 pydantic-settings
+contextvars
 
 # Vector Store & Data (If you use RAG)
 chromadb
